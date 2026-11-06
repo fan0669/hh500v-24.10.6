@@ -242,7 +242,13 @@ jobs:
 
       - name: Write feeds.conf
         run: |
-          set -e
+          # 注意：这一步不能用 set -e。`feeds update -a` 只要有一个 feed 有问题
+          # （第三方 feed 经常改结构 / 404 / 分支名变动）就整体返回 1，但其它
+          # feed 其实都已经更新好了。上一轮就是死在
+          #   Collecting target info: done
+          #   Error: Process completed with exit code 1.
+          # 所以这里改成逐个更新 + 只对"必需的 feed"做硬断言。
+          set -u
           cd openwrt
           if [ "${{ inputs.version }}" = "master" ]; then BR=master; else BR=openwrt-24.10; fi
           {
@@ -258,8 +264,27 @@ jobs:
             fi
           } > feeds.conf.default
           cat feeds.conf.default
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a || true
+
+          for f in packages luci routing telephony video qmodem small; do
+            echo "== feeds update $f"
+            ./scripts/feeds update "$f" || echo "WARN: feeds update $f returned non-zero (继续)"
+          done
+          if [ "${{ inputs.version }}" != "master" ]; then
+            echo "== feeds update kenzok8"
+            ./scripts/feeds update kenzok8 || echo "WARN: feeds update kenzok8 returned non-zero (继续)"
+          fi
+
+          ./scripts/feeds install -a || echo "WARN: feeds install -a returned non-zero (继续)"
+
+          # 只有这三个是硬需求：target 本身 + luci + qmodem（QModem 面板）
+          for f in packages luci qmodem; do
+            [ -d "feeds/$f" ] || { echo "!! feed $f is missing, 无法继续"; exit 1; }
+          done
+          echo "== feeds present =="
+          ls -1 feeds
+          echo "== 抽查关键包是否在 feed 里 =="
+          ls -d feeds/qmodem/qmodem feeds/luci/applications/luci-app-sms-tool-js 2>/dev/null || true
+          ls -d feeds/packages/net/modemmanager 2>/dev/null || true
 
       - name: Configure
         run: |
