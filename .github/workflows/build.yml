@@ -92,12 +92,16 @@ jobs:
             grep -n "tcl_linkhub" package/firmware/ipq-wifi/Makefile || true
             exit 0
           fi
-          # patch 里的 index 行指向 openwrt *master* 的前置 blob，24.10 的树里
-          # 没有那个对象，所以 git am -3 / git apply -3 必然失败。先把上游几个
-          # commit 抓进来（父提交一到，前置 blob 就在本地对象库里）。
+          # ---- 关键：patch 里的 index 行指向 openwrt *master* 的前置 blob ----
+          # 那个 blob 在 24.10 的树里根本不存在（24.10 的这些文件是另一份历史），
+          # 所以 `git am -3` 一定报
+          #   error: repository lacks the necessary blob to perform 3-way merge
+          # 然后退化成一字不差的直接 apply，hunk 全部 reject。
+          # 解法：把上游这几个 commit 以 --depth 2 抓进来 —— 父提交一到，
+          # 前置 blob 就在本地对象库里了，三方合并才有依据。
           git remote add upstream https://github.com/openwrt/openwrt.git 2>/dev/null || true
           for sha in ac8b5526bc 12fd85eb79 30378ffea4; do
-            echo "== fetch upstream $sha"
+            echo "== fetch upstream $sha (depth 2, 把前置 blob 一起取回来)"
             git fetch --depth 2 --no-tags upstream "$sha" || \
               git fetch --no-tags upstream "$sha" || echo "WARN: fetch $sha failed"
           done
@@ -114,8 +118,10 @@ jobs:
               echo "   ok: git apply -3"
               continue
             fi
-            # 最后一级：模糊匹配。注意 patch 只要有一个 hunk 不完美就回非 0，
-            # 所以这里不能判死，打完再按"结果对不对"断言（见下面的 verify）。
+            # 三方合并失败的真正原因：patch 的 index 行指向 openwrt *master* 的前置
+            # blob，24.10 的树里没有这个对象。这时只能靠模糊匹配把 hunk 落下去。
+            # 注意：patch 只要有一个 hunk 不完美就回非 0，所以这里**不能**判死，
+            # 打完补丁后再按"结果对不对"来断言（见下面的 verify）。
             echo "   fallback: patch -p1 --forward --fuzz=3"
             patch -p1 --forward --fuzz=3 -l --no-backup-if-mismatch < "/tmp/$sha.patch" || true
             echo "   rejected hunks:"
@@ -201,32 +207,13 @@ jobs:
           ls -l "$D"/706-* || true
           echo "==> 该补丁把 pci_alloc_irq_vectors 的 nr_irqs 向上取 2 的幂（HH500V 的 5G 稳定性修复）"
 
-      - name: Backport AW9523 pinctrl/LED expander (kernel 6.6 has no driver)
-        if: ${{ inputs.version != 'master' }}
-        run: |
-          set -e
-          cd openwrt
-          SRC=drivers/pinctrl/pinctrl-aw9523.c
-          # 24.10 ships kernel 6.6; the AW9523 pinctrl driver only landed in v6.11.
-          # It drives the 5G/4G/WiFi/POWER LEDs (i2c0 @0x5b) on this board.
-          if [ -f ../kernel/pinctrl-aw9523.c ]; then
-            cp ../kernel/pinctrl-aw9523.c "$SRC"
-          else
-            curl -sSL --retry 3 \
-              "https://raw.githubusercontent.com/torvalds/linux/v6.11/drivers/pinctrl/pinctrl-aw9523.c" \
-              -o "$SRC"
-          fi
-          ls -l "$SRC"
-          grep -c "awinic,aw9523-pinctrl" "$SRC"
-          if ! grep -q "PINCTRL_AW9523" drivers/pinctrl/Kconfig; then
-            printf '\nconfig PINCTRL_AW9523\n\ttristate "Awinic AW9523/AW9523B I2C GPIO expander pinctrl driver"\n\tdepends on OF && I2C\n\tselect PINMUX\n\tselect PINCONF\n\tselect GENERIC_PINCONF\n\tselect GPIOLIB_IRQCHIP\n\tselect REGMAP_I2C\n\thelp\n\t  Say Y here to enable pin controller and GPIO support for the\n\t  Awinic AW9523/AW9523B 16-bit I2C GPIO expander.\n' >> drivers/pinctrl/Kconfig
-          fi
-          if ! grep -q "pinctrl-aw9523" drivers/pinctrl/Makefile; then
-            printf 'obj-$(CONFIG_PINCTRL_AW9523)\t+= pinctrl-aw9523.o\n' >> drivers/pinctrl/Makefile
-          fi
-          tail -3 drivers/pinctrl/Makefile
-          grep -A3 "config PINCTRL_AW9523" drivers/pinctrl/Kconfig
-          echo "==> AW9523 backport ready (CONFIG_PINCTRL_AW9523=y in the target config)"
+      # 原来这里有个 "Backport AW9523 pinctrl/LED expander" 步骤，从 v6.11 把
+      # drivers/pinctrl/pinctrl-aw9523.c 拷进内核树 —— 这条路走不通：
+      #   cp: cannot create regular file 'drivers/pinctrl/pinctrl-aw9523.c': No such file or directory
+      # 因为内核源码要到 Download/prepare 阶段才解包，此刻 openwrt/ 下根本没有
+      # drivers/。而且这块板子的灯不需要内核驱动：/sys/bus/i2c/drivers 里没有
+      # aw9523，0-005b 也没绑定 driver，灯是 files/usr/bin/led-hh500v.sh 直接
+      # 通过 i2c 写的（已在设备上验证）。所以这一步整个删掉。
 
       - name: Install custom packages
         run: |
