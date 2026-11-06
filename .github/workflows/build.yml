@@ -51,25 +51,18 @@ jobs:
         run: |
           set -e
           V="${{ inputs.version }}"
-          # IMPORTANT: never use --depth here. The next step does `git am -3`
-          # (3-way merge) for ac8b5526bc; a shallow clone has no parent blobs,
-          # so every hunk dies with
-          #   "repository lacks the necessary blob to perform 3-way merge"
-          # and the backport is rejected even though the patch is fine.
-          # --filter=blob:none keeps history complete but downloads blobs
-          # lazily, so 3-way merge can fetch exactly what it needs.
+          # 不要用 --depth：后续 Backport 步骤要做 3-way merge（git am -3），
+          # 浅克隆没有父提交内容，三方合并无从下手。
+          # --filter=blob:none 保留完整历史、blob 按需下载，是这里的正解。
           if [ "$V" = "master" ]; then
             git clone --filter=blob:none -b master $REPO openwrt
           elif [ "$V" = "24.10-SNAPSHOT" ]; then
             git clone --filter=blob:none -b openwrt-24.10 $REPO openwrt
           elif [ "$V" = "24.10.6" ]; then
-            # v24.10.6 is a real git tag (target commit 5fa11a1b5689, released
-            # 2026-04-27). Building from the tag is what makes
-            # /etc/openwrt_release say "24.10.6" and points the opkg feeds at
-            # releases/24.10.6 instead of releases/24.10-SNAPSHOT.
-            # NOTE: the old path pinned the branch commit cf234f8de6d5, which
-            # carries no tag, so git describe degraded to
-            # "24.10-SNAPSHOT r0+33869-cf234f8de6".
+            # v24.10.6 是真 tag（5fa11a1b5689, 2026-04-27）。从 tag 编才能让
+            # /etc/openwrt_release 显示 24.10.6、opkg 源指向 releases/24.10.6。
+            # 旧路径 pin 的 cf234f8de6d5 没有 tag，版本会退化成
+            # "24.10-SNAPSHOT r0+33869-cf234f8de6"。
             git clone --filter=blob:none -b v24.10.6 $REPO openwrt
           else
             git clone --filter=blob:none -b "$V" $REPO openwrt || {
@@ -92,22 +85,45 @@ jobs:
             grep -n "tcl_linkhub" package/firmware/ipq-wifi/Makefile || true
             exit 0
           fi
+          # ---- 关键：patch 的 index 行指向 openwrt *master* 的前置 blob ----
+          # 那个 blob 在 24.10 的树里根本不存在（这些文件是另一条历史），
+          # 所以 `git am -3` 一定报
+          #   error: repository lacks the necessary blob to perform 3-way merge
+          # 然后退化成一字不差的直接 apply，hunk 全部 reject。
+          # 解法：把上游这几个 commit 以 --depth 2 抓进来 —— 父提交一到，
+          # 前置 blob 就在本地对象库里，三方合并才有依据。
+          git remote add upstream https://github.com/openwrt/openwrt.git 2>/dev/null || true
+          for sha in ac8b5526bc 12fd85eb79 30378ffea4; do
+            echo "== fetch upstream $sha (depth 2, 把前置 blob 一起取回来)"
+            git fetch --depth 2 --no-tags upstream "$sha" || \
+              git fetch --no-tags upstream "$sha" || echo "WARN: fetch $sha failed"
+          done
           for sha in ac8b5526bc 12fd85eb79 30378ffea4; do
             echo "== backport $sha"
             curl -sSL "https://github.com/openwrt/openwrt/commit/$sha.patch" -o "/tmp/$sha.patch"
             head -3 "/tmp/$sha.patch" || true
-            if ! git am -3 "/tmp/$sha.patch"; then
-              echo "!! git am failed, fallback to git apply -3"
-              git am --abort 2>/dev/null || true
-              git apply -3 "/tmp/$sha.patch" || {
-                echo "!! $sha does not apply to $(git describe --tags --always 2>/dev/null)"
-                echo "!! this base is unusable for the HH500V backport"
-                exit 1
-              }
-              git add -A
-              git commit -m "backport $sha" || true
+            if git am -3 "/tmp/$sha.patch"; then
+              echo "   applied with git am -3"
+              continue
             fi
+            git am --abort 2>/dev/null || true
+            if git apply -3 "/tmp/$sha.patch"; then
+              git add -A; git commit -m "backport $sha (apply -3)" || true
+              echo "   applied with git apply -3"
+              continue
+            fi
+            echo "!! 3-way merge failed, last resort: fuzzy patch -p1"
+            if patch -p1 --forward --fuzz=3 -l < "/tmp/$sha.patch"; then
+              git add -A; git commit -m "backport $sha (fuzzy)" || true
+              echo "   applied with patch --fuzz=3"
+              continue
+            fi
+            echo "!! $sha does not apply to $(git describe --tags --always 2>/dev/null)"
+            echo "!! this base is unusable for the HH500V backport"
+            exit 1
           done
+          grep -q "tcl_linkhub-hh500v" target/linux/qualcommax/image/ipq807x.mk || {
+            echo "!! device entry still missing after backports"; exit 1; }
           grep -n "tcl_linkhub-hh500v" target/linux/qualcommax/image/ipq807x.mk
           echo "NOTE: 24.10 uses kernel 6.6; the MHI IRQ fix only exists for 6.12/6.18 upstream."
 
