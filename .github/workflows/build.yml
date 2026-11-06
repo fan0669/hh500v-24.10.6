@@ -1,0 +1,166 @@
+name: Build HH500V ImmortalWrt
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'firmware version'
+        required: true
+        default: '24.10.6'
+        type: choice
+        options:
+          - '24.10.6'          # 24.10.6 (r33869, kernel 6.6.133) by commit pin -> opkg, needs backport
+          - 'v24.10.5'         # fixed tag (kernel 6.6.122) -> opkg, needs backport
+          - '24.10-SNAPSHOT'   # 24.10 branch head -> opkg, needs backport
+          - 'master'           # 6.18 kernel, native HH500V support, apk
+      plugins:
+        description: 'plugin set'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - 'full'
+          - 'basic'
+
+env:
+  REPO: https://github.com/immortalwrt/immortalwrt
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk \
+            gettext git libelf-dev libncurses5-dev libssl-dev python3 python3-distutils \
+            rsync swig unzip zlib1g-dev zip binutils bzip2 perl diffstat patch \
+            device-tree-compiler qemu-utils
+
+      - name: Clone ImmortalWrt
+        run: |
+          set -e
+          V="${{ inputs.version }}"
+          if [ "$V" = "master" ]; then
+            git clone --depth 50 -b master $REPO openwrt
+          elif [ "$V" = "24.10-SNAPSHOT" ]; then
+            git clone --depth 50 -b openwrt-24.10 $REPO openwrt
+          elif [ "$V" = "24.10.6" ]; then
+            # 24.10.6 没有 git tag，用官方构建的 revision 固定：r33869-cf234f8de6d5
+            mkdir -p openwrt
+            git -C openwrt init -q
+            git -C openwrt remote add origin $REPO
+            git -C openwrt fetch --depth 1 origin cf234f8de6d5
+            git -C openwrt checkout -q FETCH_HEAD
+          else
+            git clone --depth 1 -b "$V" $REPO openwrt || {
+              echo "tag $V 不存在，回退到 openwrt-24.10"; git clone --depth 50 -b openwrt-24.10 $REPO openwrt; }
+          fi
+          cd openwrt && git log -1 --oneline
+
+      - name: Backport HH500V device (non-master)
+        if: ${{ inputs.version != 'master' }}
+        run: |
+          set -e
+          cd openwrt
+          git config user.email ci@local
+          git config user.name ci
+          for sha in ac8b5526bc 12fd85eb79 30378ffea4; do
+            echo "=== cherry-pick $sha"
+            git fetch --depth 50 https://github.com/openwrt/openwrt.git "$sha" || \
+              git fetch https://github.com/openwrt/openwrt.git "$sha"
+            if ! git cherry-pick -3 --no-commit FETCH_HEAD; then
+              echo "!!! conflict on $sha, see patches/README.md"
+              git status --porcelain
+              exit 1
+            fi
+            git commit -m "backport $sha" || true
+          done
+          grep -n "tcl_linkhub-hh500v" target/linux/qualcommax/image/ipq807x.mk
+          echo "NOTE: 24.10 uses kernel 6.6; the MHI IRQ fix only exists for 6.12/6.18 upstream."
+
+      - name: Backport MHI IRQ fix to 6.6 (non-master)
+        if: ${{ inputs.version != 'master' }}
+        run: |
+          set -e
+          cd openwrt
+          D=target/linux/generic/backport-6.6
+          mkdir -p "$D"
+          cp ../patches/706-v7.2-bus-mhi-host-pci_generic-round-up-nr_irqs-to-a-power-of-two.patch "$D/"
+          ls -l "$D"/706-* || true
+          echo "==> 该补丁把 pci_alloc_irq_vectors 的 nr_irqs 向上取 2 的幂（HH500V 的 5G 稳定性修复）"
+
+      - name: Install custom packages
+        run: |
+          set -e
+          mkdir -p openwrt/package/custom
+          cp -r custom-packages/* openwrt/package/custom/
+          find openwrt/package/custom -maxdepth 2 -name Makefile
+
+      - name: Write feeds.conf
+        run: |
+          set -e
+          cd openwrt
+          if [ "${{ inputs.version }}" = "master" ]; then BR=master; else BR=openwrt-24.10; fi
+          {
+            echo "src-git packages https://github.com/immortalwrt/packages.git;$BR"
+            echo "src-git luci https://github.com/immortalwrt/luci.git;$BR"
+            echo "src-git routing https://github.com/immortalwrt/routing.git;$BR"
+            echo "src-git telephony https://github.com/immortalwrt/telephony.git;$BR"
+            echo "src-git video https://github.com/immortalwrt/video.git;$BR"
+            echo "src-git qmodem https://github.com/FUjr/QModem.git;main"
+            echo "src-git small https://github.com/kenzok8/small-package.git;main"
+            if [ "${{ inputs.version }}" != "master" ]; then
+              echo "src-git kenzok8 https://github.com/kenzok8/openwrt-packages.git;master"
+            fi
+          } > feeds.conf.default
+          cat feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a || true
+
+      - name: Configure
+        run: |
+          set -e
+          cd openwrt
+          if [ "${{ inputs.plugins }}" = "basic" ]; then
+            cp ../configs/hh500v-basic.config .config
+          elif [ "${{ inputs.version }}" = "master" ]; then
+            cp ../configs/hh500v-master.config .config
+          else
+            cp ../configs/hh500v-24.10.config .config
+          fi
+          make defconfig
+          grep -E "CONFIG_TARGET_qualcommax" .config | head -8
+
+      - name: Download
+        run: |
+          cd openwrt
+          make download -j8 || make download -j1 V=s
+
+      - name: Build
+        run: |
+          cd openwrt
+          make -j$(nproc) || make -j1 V=s
+
+      - name: Collect
+        run: |
+          mkdir -p out
+          find openwrt/bin/targets -type f -name '*hh500v*' -exec cp -v {} out/ \; || true
+          ls -lh out || true
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: hh500v-${{ inputs.version }}-${{ inputs.plugins }}
+          path: out/
+          if-no-files-found: error
