@@ -1,0 +1,2 @@
+*/2 * * * * /usr/bin/wan-watchdog.sh
+*/10 * * * * /usr/bin/hh500v-at-recover.sh

@@ -1,0 +1,52 @@
+#!/bin/sh /etc/rc.common
+# HH500V safe shutdown helper.
+#
+# Background: on this image, rebooting while the MBIM data session is up can
+# hang the shutdown path; the kernel watchdog then resets the box and the
+# vendor bootloader falls into its "dump all RAM over TFTP" recovery mode,
+# which looks like a brick until power is removed.
+#
+# This script runs early in the shutdown sequence and tears the modem session
+# down in a controlled way, so `reboot`/`poweroff` finishes normally.
+
+START=96
+STOP=04
+USE_PROCD=0
+
+stop() {
+	# 1. keep the watchdog from touching things while we shut down
+	[ -x /usr/bin/wan-watchdog.sh ] && rm -f /tmp/wan-watch.cnt 2>/dev/null
+
+	# 2. bring the MBIM session down politely (bounded wait)
+	if [ -x /sbin/ifdown ]; then
+		( ifdown wwan ) >/dev/null 2>&1 &
+		_pid=$!
+		_i=0
+		while [ $_i -lt 8 ]; do
+			kill -0 $_pid 2>/dev/null || break
+			sleep 1
+			_i=$((_i + 1))
+		done
+		kill -9 $_pid 2>/dev/null
+	fi
+
+	# 3. release the MBIM control channel so umbim/netifd do not race on exit
+	killall -q umbim 2>/dev/null
+	sleep 1
+
+	# 3b. stop the two pty proxies and drop their bind mounts. If they are still
+	# alive when the drivers shut down, the reboot sometimes never completes
+	# (box stays powered, no network, needs a power cycle). See hh500v-reboot.sh.
+	for _s in hh500v-atgw hh500v-mbimprox; do
+		[ -x /etc/init.d/$_s ] && /etc/init.d/$_s stop >/dev/null 2>&1
+	done
+	killall -q hh500v-atgw hh500v-mbimprox 2>/dev/null
+	sleep 1
+	for _m in /dev/ttyUSB1 /dev/ttyUSB2 /dev/ttyUSB3 /dev/wwan0mbim0; do
+		grep -q " $_m " /proc/mounts 2>/dev/null && umount "$_m" 2>/dev/null
+	done
+
+	# 4. flush so the overlay is consistent on the next boot
+	sync
+	return 0
+}

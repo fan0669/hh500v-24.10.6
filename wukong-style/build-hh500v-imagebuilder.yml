@@ -1,0 +1,64 @@
+name: Build HH500V via ImageBuilder (wukong-style)
+
+# 和 wukongdaily/ImmortalWrt-ImageBuilder 的 build-wireless-router.yml 同思路：
+# 用 ImageBuilder + PROFILE + PACKAGES 打包，10~20 分钟出固件。
+# 区别：HH500V 只在 snapshot 里有 profile，所以这里用 snapshot 的 ImageBuilder tar。
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: '额外包（空格分隔）'
+        required: false
+        default: ''
+
+env:
+  TARGET: qualcommax/ipq807x
+  PROFILE: tcl_linkhub-hh500v
+  BASE: https://downloads.immortalwrt.org/snapshots/targets/qualcommax/ipq807x
+  IB: immortalwrt-imagebuilder-qualcommax-ipq807x.Linux-x86_64.tar.zst
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd wget make gawk unzip
+
+      - name: Download ImageBuilder
+        run: |
+          set -e
+          wget -q "$BASE/$IB" -O ib.tar.zst
+          ls -lh ib.tar.zst
+          tar --zstd -xf ib.tar.zst
+          ls -d immortalwrt-imagebuilder-*
+
+      - name: Build image
+        run: |
+          set -e
+          cd immortalwrt-imagebuilder-*
+          # 基础包（snapshot feed 已验证存在）
+          PKGS="luci luci-app-firewall luci-i18n-base-zh-cn dropbear \
+            kmod-mhi-pci-generic kmod-mhi-wwan-ctrl kmod-mhi-wwan-mbim \
+            kmod-usb-net-cdc-mbim kmod-usb-serial-option umbim modemmanager \
+            luci-app-modemband luci-app-3ginfo-lite luci-app-sms-tool-js \
+            luci-app-openclash luci-app-passwall sing-box daed tailscale zerotier \
+            kmod-tun kmod-nft-tproxy ip-full dnsmasq-full \
+            ${{ inputs.packages }}"
+          echo "PACKAGES=$PKGS"
+          make image PROFILE="$PROFILE" PACKAGES="$PKGS" -j"$(nproc)" 2>&1 | tail -60
+          echo "=== 产物 ==="
+          ls -lh bin/targets/*/*/ || true
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: hh500v-imagebuilder
+          path: immortalwrt-imagebuilder-*/bin/targets/**/*hh500v*
+          if-no-files-found: error

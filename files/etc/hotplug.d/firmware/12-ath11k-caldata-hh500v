@@ -1,0 +1,21 @@
+#!/bin/sh
+# HH500V (TCL LINKHUB HH500V) ath11k calibration extractor.
+#
+# The upstream 11-ath11k-caldata script ships a hh500v case, but this build's
+# copy has it inserted at the wrong nesting level (after the catch-all branch
+# of the outer FIRMWARE case), so it never runs. This add-on script (12- > 11-)
+# extracts the calibration data itself, without touching the original file.
+
+[ -e "/lib/firmware/$FIRMWARE" ] && exit 0
+[ "$FIRMWARE" = "ath11k/IPQ8074/hw2.0/cal-ahb-c000000.wifi.bin" ] || exit 0
+
+. /lib/functions/caldata.sh
+
+[ "$(board_name)" = "tcl,linkhub-hh500v" ] || exit 0
+
+# 0:ART is 384 KiB; valid calibration block lives at 0x1000..0x21000
+caldata_extract "0:ART" 0x1000 0x20000
+
+# This 3HK variant stores no usable base MACs at 0x5e29c/0x5e2a2 (all 0xff),
+# so the MAC is taken from the calibration blob as-is instead of being patched.
+exit 0

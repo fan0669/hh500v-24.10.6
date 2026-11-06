@@ -1,0 +1,48 @@
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	option ipaddr '127.0.0.1'
+	option netmask '255.0.0.0'
+
+config globals 'globals'
+	option ula_prefix 'fd34:59bb:cf9::/48'
+
+# lan  = QCA8075 的三个 1G 口（内部一个交换机口）
+# wan  = QCA8081 的 2.5G 口。这台机器是 CPE，没有有线上行，所以把 2.5G 口
+#        也并进 br-lan 当 LAN 用（2026-11-06 起）。要恢复"2.5G 口做 WAN"，
+#        把 list ports 'wan' 删掉、并把下面的 wan/wan6 段 disabled 去掉即可。
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	list ports 'lan'
+	list ports 'wan'
+
+config interface 'lan'
+	option device 'br-lan'
+	option proto 'static'
+	option ipaddr '192.168.1.1'
+	option netmask '255.255.255.0'
+	option ip6assign '60'
+
+# 有线上行不用了，但保留（disabled），方便以后改回路由器模式
+config interface 'wan'
+	option device 'wan'
+	option proto 'dhcp'
+	option disabled '1'
+
+config interface 'wan6'
+	option device 'wan'
+	option proto 'dhcpv6'
+	option disabled '1'
+
+# 5G 模组（GM800 / SDX55，PCIe MHI 上的 MBIM 通道）
+# auto=0 是故意的：MHI 的 wwan 端口在模组固件还没起来时就出现了，netifd 若此时
+# 去开 MBIM 会话，mhi-pci-generic 会报 reset failed / Recovery failed: -25，
+# 数据通道随后再也起不来。/etc/init.d/hh500v-wwan-up 会在模组稳定后再 ifup wwan。
+config interface 'wwan'
+	option proto 'mbim'
+	option device '/dev/wwan0mbim0'
+	option apn '3gnet'
+	option auth 'none'
+	option ipv6 '1'
+	option auto '0'

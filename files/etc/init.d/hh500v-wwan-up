@@ -1,0 +1,121 @@
+#!/bin/sh /etc/rc.common
+# Bring the MBIM data path up well after the modem has finished booting.
+#
+# Why this exists: network.wwan.auto is deliberately 0. On this board the MHI
+# wwan ports show up long before the module's firmware is ready, and opening an
+# MBIM session too early makes the driver log
+#     mhi-pci-generic 0000:01:00.0: reset
+#     mhi-pci-generic 0000:01:00.0: reset failed
+#     mhi-pci-generic 0000:01:00.0: Recovery failed: -25
+# after which /dev/wwan*mbim0 never comes back. Waiting for the modem to settle
+# and only then doing `ifup wwan` keeps the MHI control channel alive.
+START=97
+STOP=20
+USE_PROCD=0
+
+WD=/tmp/wwan-up.log
+say() { echo "$(date +%H:%M:%S) $*" >>"$WD"; }
+
+find_port() {
+	for d in /dev/wwan0mbim0 /dev/wwan1mbim0 /dev/wwan2mbim0 /dev/wwan3mbim0; do
+		[ -e "$d" ] && { echo "$d"; return 0; }
+	done
+	return 1
+}
+
+bringup() {
+	: >"$WD"
+	say "waiting for an MHI MBIM port"
+
+	i=0
+	while [ $i -lt 90 ]; do
+		i=$((i + 1))
+		port=$(find_port)
+		[ -n "$port" ] && break
+		sleep 5
+	done
+
+	if [ -z "$port" ]; then
+		say "no /dev/wwan*mbim0 after 450s (modem not on pcie?)"
+		return 1
+	fi
+	say "port=$port; letting the modem settle"
+
+	# The module needs ~90s after the ports appear before it answers MBIM
+	# reliably. Rushing this is what breaks the session.
+	sleep 90
+
+	cur=$(uci -q get network.wwan.device)
+	if [ "$cur" != "$port" ]; then
+		uci set network.wwan.device="$port"
+		uci commit network
+		/usr/libexec/network/reload 2>/dev/null || ubus call network reload 2>/dev/null
+		say "device -> $port"
+	fi
+
+	try=0
+	while [ $try -lt 6 ]; do
+		try=$((try + 1))
+		say "ifup wwan (try $try)"
+		ifup wwan
+		sleep 20
+		if ifstatus wwan | grep -q '"up": *true'; then
+			say "wwan up on $port"
+			ip -4 addr show "$(ifstatus wwan | jsonfilter -e '@.l3_device' 2>/dev/null)" 2>/dev/null | grep inet >>"$WD"
+			return 0
+		fi
+		sleep 20
+		if [ $try -ge 2 ]; then
+			# After a warm reset (panic + watchdog) the module can keep a
+			# half-dead MBIM session from the previous boot, and umbim then
+			# dies with "message not long enough" while checking the
+			# subscriber. Rebuilding the proxy session clears it; this is the
+			# same dance that recovers the box by hand (2026-11-06 02:58).
+			say "still down; rebuilding the mbim session (try $try)"
+			ifdown wwan 2>/dev/null
+			/etc/init.d/hh500v-mbimprox stop 2>/dev/null
+			sleep 2
+			umount /dev/wwan0mbim0 2>/dev/null
+			/etc/init.d/hh500v-mbimprox start 2>/dev/null
+			sleep 5
+		fi
+	done
+
+	say "wwan bring-up failed after 6 tries"
+	return 1
+}
+
+gate_and_bringup() {
+	# AT mode: the module only serves AT while no data session is open, so if
+	# the user armed AT mode (see /usr/bin/hh500v-at-mode.sh) we deliberately
+	# keep wwan down. Nothing else in this image brings it up (auto=0).
+	if [ "$(cat /etc/hh500v.at-mode 2>/dev/null)" = "at" ]; then
+		say "AT mode armed (/etc/hh500v.at-mode), holding wwan down"
+		# A one-shot "window" run clears the flag as soon as its command has
+		# been executed by hh500v-at-port.sh; wait for that, then carry on.
+		i=0
+		while [ $i -lt 60 ]; do
+			i=$((i + 1))
+			[ "$(cat /etc/hh500v.at-mode 2>/dev/null)" = "at" ] || break
+			sleep 10
+		done
+		if [ "$(cat /etc/hh500v.at-mode 2>/dev/null)" = "at" ]; then
+			say "still in AT mode, leaving wwan down"
+			return 0
+		fi
+		say "AT window finished, bringing wwan up"
+	fi
+	bringup
+}
+
+boot() {
+	( gate_and_bringup ) >/dev/null 2>&1 &
+}
+
+start() {
+	( gate_and_bringup ) >/dev/null 2>&1 &
+}
+
+stop() {
+	rm -f "$WD"
+}

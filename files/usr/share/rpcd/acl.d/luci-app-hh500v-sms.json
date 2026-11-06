@@ -1,0 +1,23 @@
+{
+	"luci-app-hh500v-sms": {
+		"description": "Grant access to the HH500V SMS panel",
+		"read": {
+			"cgi-io": [ "exec" ],
+			"file": {
+				"/usr/bin/hh500v-sms-list.sh": [ "exec" ],
+				"/usr/bin/hh500v-sms.uc": [ "exec" ],
+				"/usr/bin/hh500v-sim-clear.sh": [ "exec" ],
+				"/etc/hh500v-sms.txt": [ "read" ],
+				"/etc/hh500v-sim-clear.log": [ "read" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/bin/hh500v-sms-list.sh": [ "exec" ],
+				"/usr/bin/hh500v-sms.uc": [ "exec" ],
+				"/usr/bin/hh500v-sim-clear.sh": [ "exec" ],
+				"/etc/hh500v-sms.txt": [ "write" ]
+			}
+		}
+	}
+}

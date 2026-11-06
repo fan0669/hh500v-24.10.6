@@ -1,0 +1,17 @@
+#!/bin/sh /etc/rc.common
+# Keep the HH500V status LEDs in sync with the system state.
+# Runs the updater every 10 s; the updater itself prefers /sys/class/leds
+# (when the AW9523 driver is present) and falls back to raw I2C otherwise.
+
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance leds
+	procd_set_param command /bin/sh -c 'while true; do /usr/bin/led-hh500v.sh; sleep 10; done'
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}

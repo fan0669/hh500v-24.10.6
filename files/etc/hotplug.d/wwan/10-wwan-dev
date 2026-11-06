@@ -1,0 +1,27 @@
+#!/bin/sh
+# Keep network.wwan.device pointed at whichever MHI MBIM port exists.
+# MHI and USB QMI race for wwan0/wwan1 numbering, so hardcoding the
+# index breaks the interface on some boots.
+[ "$ACTION" = "add" ] || exit 0
+
+port="$DEVNAME"
+[ -n "$port" ] || port="$(basename "$DEVPATH")"
+
+case "$port" in
+*mbim0) ;;
+*) exit 0 ;;
+esac
+
+[ -e "/dev/$port" ] || exit 0
+
+cur="$(uci -q get network.wwan.device)"
+[ "$cur" = "/dev/$port" ] && exit 0
+
+logger -t wwan-dev "binding network.wwan.device=/dev/$port (was $cur)"
+uci set network.wwan.device="/dev/$port"
+uci commit network
+# NOTE: do not `ifup wwan` here. The MHI wwan ports appear while the modem is
+# still booting; opening an MBIM session at that moment makes mhi-pci-generic
+# report "reset failed / Recovery failed: -25" and the data path never comes up.
+# /etc/init.d/hh500v-wwan-up does the bring-up once the modem has settled.
+logger -t wwan-dev "device bound; bring-up deferred to hh500v-wwan-up"

@@ -1,0 +1,116 @@
+#!/bin/sh /etc/rc.common
+# One warm restart after a cold start, so the 5G modem works again.
+#
+# The GM800's PCIe endpoint only appears once its own firmware has booted
+# (~2.5 min), but qcom-pcie gives up after ~1.2 s and - in kernel 6.6 - has no
+# .remove(), so the link can never be re-trained without a restart. After a real
+# power cut the module therefore always loses the race:
+#     qcom-pcie 20000000.pci: Phy link never came up
+# On a *warm* restart the module keeps its 12 V rail, its endpoint is already up
+# when the host probes, the link trains at ~1.2 s and everything works.
+#
+# This guard performs exactly one warm restart when the link is missing, using a
+# marker in /etc so a broken state cannot turn into a restart loop.
+#
+# Restarting goes through /usr/bin/hh500v-reset.sh, which panics the kernel and
+# lets the APSS watchdog do a hardware reset. Every software reset path on this
+# board (reboot, reboot -f, SysRq-b) leaves it powered but dead ~1 time in 3 and
+# needs a physical power cycle; the watchdog one was verified to come back with
+# the modem still enumerated on PCIe. /etc/hh500v-coldboot-noreboot turns the
+# whole thing into report-only.
+START=98
+STOP=50
+USE_PROCD=0
+
+MARK=/etc/hh500v-coldboot-rebooted
+LOG=/tmp/coldboot.log
+NOREBOOT=/etc/hh500v-coldboot-noreboot
+
+say() { echo "$(date +%H:%M:%S) $*" >>"$LOG"; }
+
+have_modem() { [ -d /sys/bus/pci/devices/0000:01:00.0 ]; }
+
+# last chance before restarting: a plain rescan, then a driver unbind/bind if
+# qcom-pcie happens to be a module (it is built in at the moment, this is cheap)
+try_pcie_recover() {
+	i=0
+	while [ $i -lt 3 ]; do
+		i=$((i + 1))
+		[ -e /sys/bus/pci/rescan ] && echo 1 >/sys/bus/pci/rescan 2>/dev/null
+		sleep 3
+		have_modem && { say "modem showed up after rescan #$i"; return 0; }
+	done
+	if [ -d /sys/bus/platform/drivers/qcom-pcie ]; then
+		for dev in /sys/bus/platform/drivers/qcom-pcie/*; do
+			case "$dev" in
+			*/20000000.pci|*/20000000.pci:*)
+				say "rebinding $(basename "$dev")"
+				echo "$(basename "$dev")" >/sys/bus/platform/drivers/qcom-pcie/unbind 2>/dev/null
+				sleep 2
+				echo "$(basename "$dev")" >/sys/bus/platform/drivers/qcom-pcie/bind 2>/dev/null
+				sleep 5
+				have_modem && { say "modem showed up after driver rebind"; return 0; }
+				;;
+			esac
+		done
+	fi
+	return 1
+}
+
+# hardware reset: the kernel panics and the APSS watchdog resets the SoC
+restart_now() {
+	say "restarting via hh500v-reset.sh (panic -> watchdog)"
+	logger -t hh500v-coldboot "modem not on pcie after cold boot, warm reset via watchdog"
+	exec /usr/bin/hh500v-reset.sh --now
+}
+
+guard() {
+	: >"$LOG"
+	if have_modem; then
+		say "modem already on pcie - nothing to do"
+		rm -f "$MARK"
+		return 0
+	fi
+
+	say "no modem on pcie at boot; waiting 300s in case it shows up"
+	i=0
+	while [ $i -lt 60 ]; do
+		i=$((i + 1))
+		sleep 5
+		if have_modem; then
+			say "modem appeared on pcie after $((i * 5))s"
+			rm -f "$MARK"
+			return 0
+		fi
+	done
+
+	if [ -f "$MARK" ]; then
+		say "still no modem on pcie and we already restarted once - staying up"
+		return 1
+	fi
+
+	# Only restart if the module itself is alive (otherwise we would just loop).
+	port=""
+	for p in /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB3 /dev/ttyUSB0; do
+		[ -c "$p" ] && { port="$p"; break; }
+	done
+	if [ -z "$port" ]; then
+		say "module serial ports absent as well - not restarting"
+		return 1
+	fi
+
+	try_pcie_recover && { rm -f "$MARK"; return 0; }
+
+	if [ -f "$NOREBOOT" ]; then
+		say "module alive on $port but no pcie link; restart disabled by $NOREBOOT"
+		return 1
+	fi
+
+	say "module is alive on $port but not on pcie: doing one warm restart"
+	touch "$MARK"
+	(sleep 2; restart_now) >/dev/null 2>&1 &
+	return 0
+}
+
+boot() { ( guard ) >/dev/null 2>&1 & }
+start() { ( guard ) >/dev/null 2>&1 & }

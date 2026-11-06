@@ -1,0 +1,121 @@
+#!/bin/sh
+# HH500V first-boot fixups (run once by /etc/uci-defaults during first boot).
+
+# 1) netifd's mbim proto resolves the data interface through /sys/class/usbmisc,
+#    which does not exist for wwan-port control devices such as /dev/wwan0mbim0
+#    (MHI MBIM on this board). Teach it to also look in /sys/class/wwan.
+F=/lib/netifd/proto/mbim.sh
+if [ -f "$F" ] && ! grep -q '/sys/class/wwan' "$F"; then
+	sed -i 's#readlink -f /sys/class/usbmisc/$devname/device/#readlink -f /sys/class/wwan/$devname/device/ 2>/dev/null || readlink -f /sys/class/usbmisc/$devname/device/#' "$F"
+fi
+
+# 2b) never let netifd bring wwan up on its own: the MBIM session has to be
+#     opened only after the modem has finished booting, otherwise mhi-pci-generic
+#     logs "reset failed / Recovery failed: -25" and the data path stays dead.
+#     /etc/init.d/hh500v-wwan-up does the delayed bring-up instead.
+uci -q set network.wwan.auto='0'
+uci -q commit network
+
+# 2c) put the 5G interface into the wan firewall zone so NAT works
+uci -q get firewall.@zone[1] >/dev/null 2>&1 && {
+	case " $(uci -q get firewall.@zone[1].network) " in
+		*" wwan "*) ;;
+		*) uci -q add_list firewall.@zone[1].network='wwan'; uci -q commit firewall ;;
+	esac
+}
+
+# 3) ModemManager fights with the mbim/qmi stack on this module - keep it off
+[ -x /etc/init.d/modemmanager ] && /etc/init.d/modemmanager disable 2>/dev/null
+
+# 3b) ubus-at-daemon holds /dev/ttyUSBx open exclusively, so it must not run for
+#     the whole boot. hh500v-at-port.sh starts it only for the one SMS sync (the
+#     only thing that needs it) and stops it again right afterwards.
+if [ -x /etc/init.d/ubus-at-daemon ]; then
+	/etc/init.d/ubus-at-daemon stop 2>/dev/null
+	/etc/init.d/ubus-at-daemon disable 2>/dev/null
+fi
+
+# 3c) the QModem pieces that only read the modem (no dialing - netifd owns that)
+for s in qmodem_init qmodem-settings; do
+	[ -x /etc/init.d/$s ] || continue
+	chmod 755 /etc/init.d/$s
+	/etc/init.d/$s enable 2>/dev/null
+done
+# qmodem-smsd used to spawn `sms_tool_q -d /dev/ttyUSB2 at AT+CGSN` over and
+# over; on this firmware AT+CGSN answers +CME ERROR, so those children never
+# exited, piled up and held the AT port. hh500v-qmodem-atfix.sh removes the
+# AT+CGSN call and adds -t 8 timeouts, so keeping smsd enabled is safe again -
+# and it is what publishes the `qmodem.sms` ubus object the LuCI SMS pages need.
+for s in qmodem-smsd; do
+	[ -x /etc/init.d/$s ] || continue
+	/etc/init.d/$s enable 2>/dev/null
+done
+# the monitor/uplink/ttl/led helpers only poll through the AT port and fight
+# with netifd's dialer, so they stay off.
+for s in qmodem_monitor qmodem_network qmodem-uplink qmodem_ttl qmodem_led; do
+	[ -x /etc/init.d/$s ] || continue
+	/etc/init.d/$s stop 2>/dev/null
+	/etc/init.d/$s disable 2>/dev/null
+done
+
+# 4) the modem's PCIe link often fails to train during boot; run the rescan loop
+[ -x /etc/init.d/hh500v-pcie-rescan ] && {
+	chmod 755 /etc/init.d/hh500v-pcie-rescan
+	/etc/init.d/hh500v-pcie-rescan enable 2>/dev/null
+	/etc/init.d/hh500v-pcie-rescan start 2>/dev/null
+}
+
+# 5) LED daemon, AT-port discovery, delayed wwan bring-up and the wan watchdog.
+# hh500v-mbimprox must be enabled too: it owns /dev/wwan0mbim0 from before the
+# dial, and without it the SMS indications from the modem are lost (found by the
+# 2026-11-05 audit: the service was never in this list, so it stayed disabled).
+for s in hh500v-mbimprox hh500v-leds hh500v-at-port hh500v-wwan-up hh500v-coldboot hh500v-atgw; do
+	[ -x /etc/init.d/$s ] || continue
+	chmod 755 /etc/init.d/$s
+	/etc/init.d/$s enable 2>/dev/null
+done
+for f in hh500v-at-port.sh led-hh500v.sh wan-watchdog.sh hh500v-at-recover.sh hh500v-qmodem-atfix.sh hh500v-3ginfo-fix.sh hh500v-at-mode.sh hh500v-atgw hh500v-mbimprox hh500v-band.sh hh500v-netmode.sh hh500v-ca.sh hh500v-sig-cache.sh hh500v-reboot.sh hh500v-reset.sh hh500v-ca.uc hh500v-ca-mode.sh hh500v-sim-clear.sh; do
+	[ -f /usr/bin/$f ] && chmod 755 /usr/bin/$f
+done
+
+# 5b) bound every QModem AT exchange with a timeout: its at() helper otherwise
+#     lets a non-answering command (AT+CGSN on this firmware) hold the tty
+#     forever, and the pile-up is what kills the AT port until a power cycle.
+[ -x /usr/bin/hh500v-qmodem-atfix.sh ] && /usr/bin/hh500v-qmodem-atfix.sh
+
+# 5c) 3ginfo-lite's gcom/sms_tool calls have no timeout, which makes its LuCI
+#     page spin forever once the data session silences AT.
+[ -x /usr/bin/hh500v-3ginfo-fix.sh ] && /usr/bin/hh500v-3ginfo-fix.sh
+
+# 6) Tailscale autostarts on boot but there is no usable tailnet config here
+#    (the image also lacks kmod-nft-compat, so it cannot come up in tun mode).
+#    Left enabled it does nothing but spam the log every few seconds:
+#      health(warnable=wantrunning-false): error: Tailscale is stopped
+#      logtail: dial "log.tailscale.com:443" failed: lookup ...
+#    So keep it installed but disabled; enable it by hand when it is wanted:
+#      /etc/init.d/tailscale enable && /etc/init.d/tailscale start
+#    (the init script is named "tailscale", not "tailscaled" - that is why an
+#    earlier attempt to disable "tailscaled" failed with "not found".)
+if [ -x /etc/init.d/tailscale ] && [ ! -e /etc/hh500v-tailscale-on ]; then
+	/etc/init.d/tailscale stop 2>/dev/null
+	/etc/init.d/tailscale disable 2>/dev/null
+fi
+if [ -x /etc/init.d/tailscaled ] && [ ! -e /etc/hh500v-tailscale-on ]; then
+	/etc/init.d/tailscaled stop 2>/dev/null
+	/etc/init.d/tailscaled disable 2>/dev/null
+fi
+
+# 7) ModemManager is installed (it was tried as an SMS path and lost: its MBIM
+#    plugin refuses our "wwan/wwan0mbim0" port type).  The daemon is disabled,
+#    but its udev hotplug hooks still fire on every netdev and log
+#        daemon.err ModemManager[..]: hotplug: Couldn't report kernel event:
+#        error: couldn't find the ModemManager process in the bus
+#    twice per boot.  Drop the hooks while the daemon is disabled; they come
+#    back with the package if ModemManager is ever enabled again.
+if ! /etc/init.d/modemmanager enabled 2>/dev/null; then
+	rm -f /etc/hotplug.d/net/25-modemmanager-net \
+	      /etc/hotplug.d/tty/25-modemmanager-tty \
+	      /etc/hotplug.d/wwan/25-modemmanager-wwan
+fi
+
+exit 0

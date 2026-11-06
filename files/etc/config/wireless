@@ -1,0 +1,37 @@
+config wifi-device 'radio0'
+	option type 'mac80211'
+	option path 'platform/soc@0/c000000.wifi'
+	option band '5g'
+	option channel '36'
+	# HE160 verified working 2026-11-04: channel 36, width 160 MHz, center1 5250.
+	# 160 MHz at ch36 spans 5170-5330, which includes the DFS channels 52-64, so
+	# hostapd does a 60 s CAC at every boot before the AP comes up. Clients that
+	# only do 80 MHz still work (they use the primary 80 = ch36-48).
+	option htmode 'HE160'
+	option country 'CN'
+	option disabled '0'
+
+config wifi-iface 'default_radio0'
+	option device 'radio0'
+	option network 'lan'
+	option mode 'ap'
+	option ssid 'ImmortalWrt'
+	option encryption 'psk2+ccmp'
+	option key '12345678'
+
+config wifi-device 'radio1'
+	option type 'mac80211'
+	option path 'platform/soc@0/c000000.wifi+1'
+	option band '2g'
+	option channel '1'
+	option htmode 'HE20'
+	option country 'CN'
+	option disabled '0'
+
+config wifi-iface 'default_radio1'
+	option device 'radio1'
+	option network 'lan'
+	option mode 'ap'
+	option ssid 'ImmortalWrt'
+	option encryption 'psk2+ccmp'
+	option key '12345678'

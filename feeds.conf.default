@@ -1,0 +1,12 @@
+src-git packages https://github.com/immortalwrt/packages.git;openwrt-24.10
+src-git luci https://github.com/immortalwrt/luci.git;openwrt-24.10
+src-git routing https://github.com/immortalwrt/routing.git;openwrt-24.10
+src-git telephony https://github.com/immortalwrt/telephony.git;openwrt-24.10
+src-git video https://github.com/immortalwrt/video.git;openwrt-24.10
+
+# 第三方：常见代理/加速/工具（提供 UU、mihomo、daed GUI、zerotier/tailscale GUI 等）
+src-git small https://github.com/kenzok8/small-package.git;main
+src-git kenzok8 https://github.com/kenzok8/openwrt-packages.git;master
+
+# 第三方：QModem（模组管理，含 GM800 支持）
+src-git qmodem https://github.com/FUjr/QModem.git;main

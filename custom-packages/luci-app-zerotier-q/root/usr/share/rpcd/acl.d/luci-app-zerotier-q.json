@@ -1,0 +1,14 @@
+{
+	"luci-app-zerotier-q": {
+		"description": "Grant access to ZeroTier CLI",
+		"read": {
+			"file": {
+				"/usr/bin/zerotier-cli": [ "exec" ]
+			}
+		},
+		"write": {},
+		"exec": {
+			"zerotier-cli": [ "/usr/bin/zerotier-cli" ]
+		}
+	}
+}

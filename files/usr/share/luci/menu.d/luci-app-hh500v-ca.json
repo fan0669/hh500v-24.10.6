@@ -1,0 +1,13 @@
+{
+	"admin/modem/hh500v-ca": {
+		"title": "HH500V 载波",
+		"order": 71,
+		"action": {
+			"type": "view",
+			"path": "hh500v/ca"
+		},
+		"depends": {
+			"acl": [ "luci-app-hh500v-ca" ]
+		}
+	}
+}

@@ -1,0 +1,111 @@
+#!/bin/sh
+# HH500V: make QModem accept the onboard GosunCn GM800 (SDX55) as a modem instance.
+#
+# Findings behind this script:
+#   * QModem only accepts a NAMED uci section of type 'modem-device'
+#     (e.g. 'qmodem.gm800'). Anonymous '@modem-device[0]' makes every ubus
+#     call answer: {"error":"explicit valid modem section required"}.
+#   * modem_scand keeps probing "0000:01:00.0 pcie" and every ttyUSB port;
+#     that probing is what kills the AT ports, so we disable auto-scan and
+#     declare the device explicitly.
+#   * Dialing stays with netifd (network.wwan, proto mbim) -> enable_dial=0,
+#     otherwise QModem and netifd fight over the same modem.
+
+[ -f /etc/config/qmodem ] || exit 0
+
+uci -q set qmodem.main.enable_pcie_scan='0'
+uci -q set qmodem.main.enable_usb_scan='0'
+uci -q set qmodem.main.try_preset_pcie='0'
+uci -q set qmodem.main.try_preset_usb='0'
+# block_auto_probe=1 makes qmodem_init skip every scan/preset path entirely
+uci -q set qmodem.main.block_auto_probe='1'
+uci -q set qmodem.main.enable_dial='0'
+# at_tool=1 -> AT goes through sms_tool_q instead of tom_modem.
+# This matters for the "高级配置" pages: tom_modem prints the module's answer on
+# STDERR, so the vendor scripts (get_mode / get_network_prefer / get_lockband
+# all do `$(cmd_xxx ... | grep ...)`) capture nothing and every field renders as
+# empty. sms_tool_q writes to stdout. Historically at_tool=0 was needed because
+# tom_modem was gentler on a real ttyUSB - the AT port is a pty served by
+# hh500v-atgw now, so that no longer applies.
+uci -q set qmodem.main.at_tool='1'
+
+# pick the first AT port that answers "AT"; fall back to ttyUSB2
+AT=""
+if [ -x /usr/bin/gcom ]; then
+	cat > /tmp/_hh_at.gcom <<'GCOM'
+opengt
+	set com 115200n81
+	set senddelay 0.05
+	waitquiet 1 0.2
+	send "AT\r"
+	get 1 "" $s
+	print $s
+	exit
+.
+GCOM
+	for p in /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB0 /dev/ttyUSB3; do
+		[ -c "$p" ] || continue
+		R=$(timeout 6 gcom -d "$p" -s /tmp/_hh_at.gcom 2>/dev/null)
+		case "$R" in
+			*OK*) AT="$p"; break ;;
+		esac
+	done
+	rm -f /tmp/_hh_at.gcom
+fi
+[ -n "$AT" ] || AT=/dev/ttyUSB2
+
+# the qmi_wwan_q netdev that belongs to the modem (wwan0 or wwan1)
+NETDEV=""
+for d in /sys/bus/usb/devices/3-1:1.*/net/*; do
+	[ -e "$d" ] || continue
+	NETDEV=$(basename "$d")
+done
+
+uci -q set qmodem.gm800=modem-device
+uci -q set qmodem.gm800.name='GM800'
+uci -q set qmodem.gm800.alias='HH500V'
+uci -q set qmodem.gm800.path='/sys/bus/usb/devices/3-1'
+uci -q set qmodem.gm800.data_interface='mbim'
+uci -q set qmodem.gm800.manufacturer='gosuncn'
+# use_ubus=0: QModem must talk to the AT port directly. hh500v-atgw exposes a
+# pty over /dev/ttyUSB2 that serves the SMS the MBIM proxy captured, so the
+# "direct" SMS mode is the only one that keeps working while the data session
+# is up (database mode needs both use_ubus=1 and a live ubus-at-daemon, which
+# holds the tty exclusively and breaks this modem).
+uci -q set qmodem.gm800.use_ubus='0'
+uci -q set qmodem.gm800.sms_mode='direct'
+uci -q set qmodem.gm800.enabled='1'
+uci -q set qmodem.gm800.soft_reboot='0'
+uci -q set qmodem.gm800.enable_dial='0'
+uci -q set qmodem.gm800.at_port="$AT"
+# Every pty the gateway serves must be declared, or QModem's port-ownership
+# check (instance.sh: qmodem_port_owned, which only looks at ports /
+# valid_at_ports / at_port) refuses the extra ports and the whole RPC dies
+# with exit 2 - which reaches LuCI as "No response".
+uci -q set qmodem.gm800.valid_at_ports='/dev/ttyUSB0 /dev/ttyUSB1 /dev/ttyUSB2 /dev/ttyUSB3'
+# qmodem-smsd sends its command batch on sms_at_port; keep it off $AT so it
+# does not share the pty with the daemon's URC reader (that caused
+# {"status":"error","error":"direct modem read failed"} about one call in three).
+# override_at_port is deliberately NOT set: it replaces at_port everywhere.
+uci -q set qmodem.gm800.sms_at_port='/dev/ttyUSB3'
+uci -q delete qmodem.gm800.override_at_port
+if [ -n "$NETDEV" ]; then
+	uci -q set qmodem.gm800.network="$NETDEV"
+fi
+# Vendor profile: the SDX55 is a Qualcomm platform, and that word selects the
+# qualcomm branches inside /usr/share/qmodem/vendor/gosuncn.sh.  Without it
+#   * get_mode()        expects the LTE letter codes and reports nothing
+#   * get_network_prefer() only offers 3G/4G (no 5G checkbox)
+#   * get_lockband()    uses the LTE-only ZBAND variant
+uci -q set qmodem.gm800.platform='qualcomm'
+# The dial-mode page renders this list and marks the live one (from
+# AT+ZSWITCH?, which hh500v-atgw answers as "8" = MBIM).
+uci -q set qmodem.gm800.modes='mbim qmi ecm rndis'
+# Band checkboxes for the lock-band page.  Values: AT+ZBAND? on the real module
+# (LTE 1,3,5,7,8,20,28,32,34,38,39,40,41,42,43,46 / NR5G 78) plus the GM800
+# CMIIT filing for the NR side.
+uci -q set qmodem.gm800.lte_band='1/3/5/7/8/20/28/32/34/38/39/40/41/42/43/46'
+uci -q set qmodem.gm800.sa_band='1/28/41/77/78/79'
+uci -q commit qmodem
+
+exit 0

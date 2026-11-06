@@ -1,0 +1,13 @@
+{
+	"admin/modem/hh500v-sms": {
+		"title": "HH500V 短信",
+		"order": 70,
+		"action": {
+			"type": "view",
+			"path": "hh500v/sms"
+		},
+		"depends": {
+			"acl": [ "luci-app-hh500v-sms" ]
+		}
+	}
+}

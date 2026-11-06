@@ -1,0 +1,59 @@
+#!/bin/sh /etc/rc.common
+# Bring the GM800 (SDX55) modem back onto PCIe after boot.
+#
+# Symptom this fixes: "qcom-pcie 20000000.pci: Phy link never came up" at
+# ~1.3 s into boot, which leaves only the USB side of the modem enumerated
+# (/dev/wwan0qmi0). Without the MHI/PCIe side there is no /dev/wwan*mbim0, so
+# netifd's mbim proto can never bring wwan up ("NO_DEVICE").
+#
+# Measured behaviour on this hardware: a plain `echo 1 > /sys/bus/pci/rescan`
+# makes the link train and the device appear (mhi-pci-generic ... foxconn-sdx55).
+# At S20 the modem is still powering up and the rescan finds nothing, so we
+# start late (S95) and keep retrying in the background.
+#
+# How long to keep trying: the GM800 only finishes booting ~160 s after the
+# board powers on (its USB device appears at t=162 s), and the PCIe endpoint
+# comes up after that. A 2-minute window was measured to be too short, so the
+# loop now runs for 5 minutes.
+
+START=95
+STOP=90
+USE_PROCD=0
+
+PCIDEV=/sys/bus/pci/devices/0000:01:00.0
+TRIES=60
+STEP=5
+
+scan_once() {
+	[ -d "$PCIDEV" ] && return 0
+	echo 1 > /sys/bus/pci/rescan 2>/dev/null
+	sleep 2
+	[ -d "$PCIDEV" ]
+}
+
+wait_modem() {
+	_i=0
+	while [ $_i -lt $TRIES ]; do
+		if [ -d "$PCIDEV" ]; then
+			logger -t hh500v-pcie "modem on pcie after $((_i * STEP))s"
+			return 0
+		fi
+		echo 1 > /sys/bus/pci/rescan 2>/dev/null
+		_i=$((_i + 1))
+		if [ $((_i % 12)) -eq 0 ]; then
+			logger -t hh500v-pcie "still no modem on pcie (${_i} tries)"
+		fi
+		sleep $STEP
+	done
+	logger -t hh500v-pcie "modem still not on pcie after $((TRIES * STEP))s (power-cycle needed)"
+	return 1
+}
+
+start() {
+	# run detached so init does not block on the retry loop
+	( wait_modem ) >/dev/null 2>&1 &
+}
+
+stop() {
+	:
+}

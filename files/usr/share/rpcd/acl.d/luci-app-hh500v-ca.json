@@ -1,0 +1,20 @@
+{
+	"luci-app-hh500v-ca": {
+		"description": "Grant access to the HH500V carrier (CA) panel",
+		"read": {
+			"cgi-io": [ "exec" ],
+			"file": {
+				"/usr/bin/hh500v-ca.uc": [ "exec" ],
+				"/etc/hh500v-cells.txt": [ "read" ],
+				"/etc/hh500v-modem-cfg": [ "read" ],
+				"/etc/hh500v-netmode-pushed": [ "read" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/bin/hh500v-ca.uc": [ "exec" ],
+				"/usr/bin/hh500v-ca-mode.sh": [ "exec" ]
+			}
+		}
+	}
+}

@@ -1,0 +1,84 @@
+# /usr/share/modemband/305a1421 -- TCL LINKHUB HH500V (GosunCn GM800, SDX55)
+#
+# The module answers the plain 3GPP band/registration commands, but it rejects
+# the Quectel AT+QCFG extensions that _quectel_common relies on, so writing a
+# band lock is reported as Unsupported instead of silently pretending success.
+#
+# Reading is different: with no lock applied the modem scans every supported
+# band, so "enabled" is reported as the full supported set. That keeps the LuCI
+# page happy (it treats an empty "enabled" as "cannot read", which is why every
+# field used to show "-").
+#
+# Band lists come from the module's CMIIT certification
+# (LTE: 1/3/8/34/38/39/40/41, NR: n1/n28/n41/n77/n78/n79).
+
+# Keep this on the aux pty (ttyUSB0): qmodem-smsd parks a reader on ttyUSB1 and
+# sends its command batches on ttyUSB3, so the two clients never share a port.
+_DEVICE=/dev/ttyUSB0
+_DEFAULT_LTE_BANDS="1 3 8 34 38 39 40 41"
+_DEFAULT_NR_BANDS="1 28 41 77 78 79"
+_NAME="TCL LINKHUB HH500V (GM800)"
+
+getinfo() {
+	echo "$_NAME"
+}
+
+getsupportedbands() {
+	echo "${_DEFAULT_LTE_BANDS:-Unsupported}"
+}
+
+getsupportedbandsext() {
+	echo "Unsupported"
+}
+
+getbands() {
+	echo "${_DEFAULT_LTE_BANDS:-Unsupported}"
+}
+
+getbandsext() {
+	echo "Unsupported"
+}
+
+setbands() {
+	echo "Unsupported"
+}
+
+getsupportedbands5gnsa() {
+	echo "${_DEFAULT_NR_BANDS:-Unsupported}"
+}
+
+getsupportedbandsext5gnsa() {
+	echo "Unsupported"
+}
+
+getbands5gnsa() {
+	echo "${_DEFAULT_NR_BANDS:-Unsupported}"
+}
+
+getbandsext5gnsa() {
+	echo "Unsupported"
+}
+
+setbands5gnsa() {
+	echo "Unsupported"
+}
+
+getsupportedbands5gsa() {
+	echo "${_DEFAULT_NR_BANDS:-Unsupported}"
+}
+
+getsupportedbandsext5gsa() {
+	echo "Unsupported"
+}
+
+getbands5gsa() {
+	echo "${_DEFAULT_NR_BANDS:-Unsupported}"
+}
+
+getbandsext5gsa() {
+	echo "Unsupported"
+}
+
+setbands5gsa() {
+	echo "Unsupported"
+}

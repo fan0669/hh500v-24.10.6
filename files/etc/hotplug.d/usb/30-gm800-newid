@@ -1,0 +1,20 @@
+#!/bin/sh
+# HH500V: the GosunCn GM800 (SDX55) is 305a:1421, which has no entry in the
+# mainline `option` driver, so no /dev/ttyUSB* node is created and every
+# QModem AT read fails with "has no valid AT port yet". Push the id into the
+# driver's new_id table as soon as the modem enumerates.
+
+[ "$ACTION" = "add" ] || exit 0
+
+case "$DEVPATH" in
+*/3-1) ;;
+*) exit 0 ;;
+esac
+
+[ -d /sys/bus/usb-serial/drivers/option1 ] || exit 0
+echo "305a 1421" >/sys/bus/usb-serial/drivers/option1/new_id 2>/dev/null
+logger -t hh500v-usb "added 305a:1421 to option new_id"
+
+# let the tty nodes appear, then point QModem at whichever port answers AT
+( sleep 3; /usr/bin/hh500v-at-port.sh ) >/dev/null 2>&1 &
+exit 0

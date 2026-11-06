@@ -1,0 +1,14 @@
+{
+	"admin/services/zerotier-q": {
+		"title": "ZeroTier",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "zerotier-q"
+		},
+		"depends": {
+			"acl": [ "luci-app-zerotier-q" ],
+			"uci": [ "zerotier" ]
+		}
+	}
+}

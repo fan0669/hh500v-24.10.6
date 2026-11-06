@@ -1,0 +1,114 @@
+# TCL LINKHUB HH500V / GosunCn GM800 (SDX55, MBIM over MHI)
+#
+# 3ginfo-lite reads the modem identity through gcom + a Quectel command set in
+# its stock profiles, which this device does not understand.  Everything here
+# goes through /dev/ttyUSB2, which is answered by hh500v-atgw (our AT gateway),
+# so the values come from the SMS database / identity file instead of the real
+# modem (whose AT port is silent whenever the data session is up).
+
+# 身份信息：逐条问（真机这些命令回的是裸值，可能带也可能不带 "KEY: " 前缀，
+# 所以统一取第 2 行再把可选前缀剥掉）。
+_q() {
+	timeout 5 sms_tool -d "$DEVICE" at "$1" 2>/dev/null \
+		| sed -n '2p' | sed 's/^[A-Za-z+]*: *//' | tr -d '\r' | xargs
+}
+
+FW=$(_q "AT+CGMR")
+MVENDOR=$(_q "AT+CGMI")
+MPRODUCT=$(_q "AT+CGMM")
+MODEL="$MVENDOR $MPRODUCT"
+
+# IMEI（这块模组的 AT+CGSN 会回 +CME ERROR，失败时保持空）
+NR_I=$(_q "AT+CGSN")
+[ -n "$NR_I" ] && NR_IMEI="$NR_I"
+
+# IMSI
+NR_C=$(_q "AT+CIMI")
+[ -n "$NR_C" ] && NR_IMSI="$NR_C"
+
+# ICCID
+NR_D=$(_q "AT+ICCID")
+[ -n "$NR_D" ] && NR_ICCID="$NR_D"
+
+# 协议：这块板子固定走 MHI/MBIM（没有 qmi_wwan / cdc_ether）
+PROTO="mbim"
+
+# 信号强度：3ginfo 自己从不给 RSRP/RSRQ/SINR 赋值（全局只有 JSON 里的引用），
+# 所以只能在这里算。数据来自 hh500v-atgw 的 AT+CESQ 回放，而它后面的真值是
+# 开机 AT 窗口用 hh500v-sig-cache.sh 从模组抓的（模组一旦有数据会话就不答 AT）。
+# 3GPP 编码：rsrq = 2*dB + 39 (0..34)，rsrp = dBm + 140 (0..97)，255 = 未知。
+CESQ=$(timeout 5 sms_tool -d "$DEVICE" at "AT+CESQ" 2>/dev/null)
+_rsrq=$(echo "$CESQ" | sed -n 's/.*+CESQ: *[0-9]*,[0-9]*,[0-9]*,[0-9]*,\([0-9]*\),.*/\1/p' | head -1)
+_rsrp=$(echo "$CESQ" | sed -n 's/.*+CESQ: *[0-9]*,[0-9]*,[0-9]*,[0-9]*,[0-9]*,\([0-9]*\).*/\1/p' | head -1)
+case "$_rsrq" in ''|*[!0-9]*) _rsrq=255 ;; esac
+case "$_rsrp" in ''|*[!0-9]*) _rsrp=255 ;; esac
+[ "$_rsrq" -le 34 ] && RSRQ=$(( (_rsrq - 39) / 2 ))
+[ "$_rsrp" -le 97 ] && RSRP=$(( _rsrp - 140 ))
+
+# SINR / PCI / ARFCN / band：网关只有在开机窗口真的抓到服务小区时才答
+SINFO=$(timeout 5 sms_tool -d "$DEVICE" at "AT+ZCELLINFO?" 2>/dev/null)
+case "$SINFO" in
+*+ZCELLINFO*)
+	# real format (GM800, verified 2026-11-06):
+	#   +ZCELLINFO: NR5G: tac: 0X835500,pci: 948,band : 78,cell_id: 0,
+	#               freq: 633984,mcc: 460,mnc: 01,rsrp: -70,rsrq: -11,sinr: 27
+	_line=$(echo "$SINFO" | tr -d '\r' | grep -m1 '+ZCELLINFO')
+	_pci=$(echo "$_line" | sed -n 's/.*pci: *\([0-9]\{1,4\}\).*/\1/p')
+	_arfcn=$(echo "$_line" | sed -n 's/.*freq: *\([0-9]\{1,7\}\).*/\1/p')
+	_band=$(echo "$_line" | sed -n 's/.*band *: *\([0-9]\{1,3\}\).*/\1/p')
+	_sinr=$(echo "$_line" | sed -n 's/.*sinr: *\(-\{0,1\}[0-9]\{1,3\}\).*/\1/p')
+	[ -n "$_pci" ] && [ "$_pci" != "0" ] && PCI="$_pci"
+	[ -n "$_arfcn" ] && [ "$_arfcn" != "0" ] && EARFCN="$_arfcn"
+	[ -n "$_band" ] && [ "$_band" != "0" ] && BAND="$_band"
+	[ -n "$_sinr" ] && [ "$_sinr" != "0" ] && SINR="$_sinr"
+	# band -> "n78 (3500 MHz)" and the centre frequency from the NR-ARFCN
+	# (F = 3000 + (N - 600000) * 0.015 MHz for N >= 600000)
+	if [ -n "$_band" ] && [ "$_band" != "0" ]; then
+		case "$MODE" in
+		*5G*)	PBAND="$(band5g "$_band" 2>/dev/null)" ;;
+		*)	PBAND="$(band4g "$_band" 2>/dev/null)" ;;
+		esac
+		if [ -n "$_arfcn" ] && [ "$_arfcn" -ge 600000 ] 2>/dev/null; then
+			_mhz=$(( (3000 * 1000 + (_arfcn - 600000) * 15) / 1000 ))
+			PBAND="$PBAND @${_mhz} MHz"
+		fi
+	fi
+	;;
+esac
+
+# 载波聚合（SCC1..SCC4）：这块模组的固件不提供任何 SCC 字段（AT+CLAC 的 163 条
+# 命令里没有 +ZCA*，也没有 +QCAINFO），所以只能"数小区"：hh500v-sig-cache.sh
+# 在开机 AT 窗口把 AT+ZCELLINFO? 的原文逐行存进 /etc/hh500v-cells.txt，每驻留
+# 一个小区一行。第一行是服务小区（= PCC），后面的行才是网络另外派给你的载波。
+# 3ginfo 的页面把 SCC 渲染成 "<band> | <pci> <earfcn>"，所以这里按同样格式填。
+CAF=/etc/hh500v-cells.txt
+if [ -r "$CAF" ]; then
+	_ci=0
+	while IFS= read -r _l; do
+		case "$_l" in *ZCELLINFO*) ;; *) continue ;; esac
+		_ci=$((_ci + 1))
+		[ "$_ci" -le 1 ] && continue		# 第一行 = 服务小区，就是 PCC
+		_b=$(echo "$_l" | sed -n 's/.*band *: *\([0-9]\{1,3\}\).*/\1/p')
+		_p=$(echo "$_l" | sed -n 's/.*pci: *\([0-9]\{1,5\}\).*/\1/p')
+		_f=$(echo "$_l" | sed -n 's/.*freq: *\([0-9]\{1,7\}\).*/\1/p')
+		case "$_l" in
+		*NR5G*|*nr5g*) _pre=n ;;
+		*)             _pre=B ;;
+		esac
+		_v="$_pre$_b"
+		if [ -n "$_f" ] && [ "$_f" -ge 600000 ] 2>/dev/null; then
+			_mhz=$(( (3000 * 1000 + (_f - 600000) * 15) / 1000 ))
+			_v="$_v @${_mhz} MHz"
+		fi
+		_n=$((_ci - 1))
+		eval "S${_n}BAND=\"\$_v\" S${_n}PCI=\"\$_p\" S${_n}EARFCN=\"\$_f\""
+		[ "$_n" -ge 4 ] && break
+	done < "$CAF"
+
+	# 只有一行：不是我们没抓到，而是基站只给了 1 个载波。明确写出来，
+	# 免得页面上一排 "-" 让人以为功能坏了。
+	if [ -z "$S1BAND" ] && [ "$_ci" -ge 1 ]; then
+		S1BAND="未聚合（基站只给 1 个载波）"
+	fi
+fi
+

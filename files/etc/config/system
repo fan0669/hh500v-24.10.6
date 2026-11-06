@@ -1,0 +1,25 @@
+config system
+	option hostname 'HH500V'
+	option timezone 'CST-8'
+	option zonename 'Asia/Shanghai'
+
+config timeserver 'ntp'
+	option enabled '1'
+	option enable_server '0'
+	list server 'ntp.aliyun.com'
+	list server 'cn.pool.ntp.org'
+
+# power LED: solid blue while the box is up (red is reserved for failsafe)
+config led 'led_power'
+	option name 'Power'
+	option sysfs 'blue:power'
+	option trigger 'default-on'
+
+# wifi LED: lit while the 5 GHz radio is running
+config led 'led_wlan'
+	option name 'WiFi'
+	option sysfs 'blue:wlan'
+	option trigger 'phy0radio'
+
+# 5G / 4G LEDs are driven by /usr/bin/led-hh500v.sh (band + signal colour),
+# they follow the modem state, not a kernel trigger.
