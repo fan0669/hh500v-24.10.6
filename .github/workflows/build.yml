@@ -9,7 +9,7 @@ on:
         default: '24.10.6'
         type: choice
         options:
-          - '24.10.6'          # 24.10.6 (r33869, kernel 6.6.133) by commit pin -> opkg, needs backport
+          - '24.10.6'          # v24.10.6 tag (5fa11a1b, 2026-04-27) -> opkg, needs backport
           - 'v24.10.5'         # fixed tag (kernel 6.6.122) -> opkg, needs backport
           - '24.10-SNAPSHOT'   # 24.10 branch head -> opkg, needs backport
           - 'master'           # 6.18 kernel, native HH500V support, apk
@@ -56,12 +56,14 @@ jobs:
           elif [ "$V" = "24.10-SNAPSHOT" ]; then
             git clone --depth 50 -b openwrt-24.10 $REPO openwrt
           elif [ "$V" = "24.10.6" ]; then
-            # 24.10.6 没有 git tag，用官方构建的 revision 固定：r33869-cf234f8de6d5
-            mkdir -p openwrt
-            git -C openwrt init -q
-            git -C openwrt remote add origin $REPO
-            git -C openwrt fetch --depth 1 origin cf234f8de6d5
-            git -C openwrt checkout -q FETCH_HEAD
+            # v24.10.6 is a real git tag (target commit 5fa11a1b5689, released
+            # 2026-04-27). Building from the tag is what makes
+            # /etc/openwrt_release say "24.10.6" and points the opkg feeds at
+            # releases/24.10.6 instead of releases/24.10-SNAPSHOT.
+            # NOTE: the old path pinned the branch commit cf234f8de6d5, which
+            # carries no tag, so git describe degraded to
+            # "24.10-SNAPSHOT r0+33869-cf234f8de6".
+            git clone --depth 1 -b v24.10.6 $REPO openwrt
           else
             git clone --depth 1 -b "$V" $REPO openwrt || {
               echo "tag $V 不存在，回退到 openwrt-24.10"; git clone --depth 50 -b openwrt-24.10 $REPO openwrt; }
@@ -75,19 +77,75 @@ jobs:
           cd openwrt
           git config user.email ci@local
           git config user.name ci
+          # 有些基座（比如将来的 24.10.x / 25.12）已经自带这块板子，那就别再打补丁
+          if grep -q "tcl_linkhub-hh500v" target/linux/qualcommax/image/ipq807x.mk; then
+            echo "== device already present in this base, skip the backports =="
+            grep -n "tcl_linkhub-hh500v" target/linux/qualcommax/image/ipq807x.mk
+            grep -n "tcl_linkhub" package/firmware/ipq-wifi/Makefile || true
+            exit 0
+          fi
           for sha in ac8b5526bc 12fd85eb79 30378ffea4; do
-            echo "=== cherry-pick $sha"
-            git fetch --depth 50 https://github.com/openwrt/openwrt.git "$sha" || \
-              git fetch https://github.com/openwrt/openwrt.git "$sha"
-            if ! git cherry-pick -3 --no-commit FETCH_HEAD; then
-              echo "!!! conflict on $sha, see patches/README.md"
-              git status --porcelain
-              exit 1
+            echo "== backport $sha"
+            curl -sSL "https://github.com/openwrt/openwrt/commit/$sha.patch" -o "/tmp/$sha.patch"
+            head -3 "/tmp/$sha.patch" || true
+            if ! git am -3 "/tmp/$sha.patch"; then
+              echo "!! git am failed, fallback to git apply -3"
+              git am --abort 2>/dev/null || true
+              git apply -3 "/tmp/$sha.patch" || {
+                echo "!! $sha does not apply to $(git describe --tags --always 2>/dev/null)"
+                echo "!! this base is unusable for the HH500V backport"
+                exit 1
+              }
+              git add -A
+              git commit -m "backport $sha" || true
             fi
-            git commit -m "backport $sha" || true
           done
           grep -n "tcl_linkhub-hh500v" target/linux/qualcommax/image/ipq807x.mk
           echo "NOTE: 24.10 uses kernel 6.6; the MHI IRQ fix only exists for 6.12/6.18 upstream."
+
+      # A/B 双分区 sysupgrade（换槽 + 保留旧系统）靠三个文件，24.10 基座里一个都没有：
+      #   lib/upgrade/tcl.sh            ac8b5526bc 新增
+      #   lib/upgrade/platform.sh 的 tcl,linkhub-hh500v) 分支   ac8b5526bc 新增
+      #   lib/functions/bootconfig.sh   24.10 基座缺，tcl.sh 靠它读写 0:BOOTCONFIG
+      # 缺任何一个，sysupgrade 会退回通用 nand_do_upgrade —— 直接覆盖正在跑的分区，
+      # 一旦刷坏就只能走 TFTP 救砖。所以这里补齐 + 断言，不依赖 cherry-pick 是否干净。
+      - name: Ensure A/B sysupgrade helpers (tcl.sh + bootconfig.sh)
+        if: ${{ inputs.version != 'master' }}
+        run: |
+          set -e
+          cd openwrt
+          T=target/linux/qualcommax/ipq807x/base-files
+          D=$T/lib/upgrade
+          F=$T/lib/functions
+          mkdir -p "$D" "$F"
+
+          # 1) platform.sh：插 tcl,linkhub-hh500v) 分支（已存在则跳过）
+          python3 ../port/insert-hh500v-case.py "$D/platform.sh"
+
+          # 2) tcl.sh：换分区 + 修 bootdelay
+          if [ -s "$D/tcl.sh" ]; then
+            echo "tcl.sh already present ($(wc -l < "$D/tcl.sh") lines)"
+          else
+            cp ../port/upstream/tcl.sh "$D/tcl.sh"
+            echo "tcl.sh restored from port/upstream"
+          fi
+
+          # 3) bootconfig.sh：读写 0:BOOTCONFIG / 0:BOOTCONFIG1 的 rootfs 主备位
+          if [ -s "$F/bootconfig.sh" ]; then
+            echo "bootconfig.sh already present"
+          else
+            cp ../port/upstream/bootconfig.sh "$F/bootconfig.sh"
+            echo "bootconfig.sh restored from port/upstream"
+          fi
+
+          # 4) 断言：三个文件都在，且 platform.sh 认得这块板子
+          test -s "$D/tcl.sh" || { echo "!! tcl.sh missing"; exit 1; }
+          test -s "$F/bootconfig.sh" || { echo "!! bootconfig.sh missing"; exit 1; }
+          grep -q 'linkhub-hh500v' "$D/platform.sh" || { echo "!! platform.sh has no hh500v case"; exit 1; }
+          grep -q 'bootconfig.sh' "$D/tcl.sh" || echo "WARN: tcl.sh does not source bootconfig.sh"
+          grep -n 'linkhub-hh500v' "$D/platform.sh"
+          ls -l "$D/tcl.sh" "$D/platform.sh" "$F/bootconfig.sh"
+          echo "==> A/B sysupgrade helpers OK: sysupgrade 会换到另一个 slot，旧系统留着能回退"
 
       - name: Backport MHI IRQ fix to 6.6 (non-master)
         if: ${{ inputs.version != 'master' }}
@@ -100,67 +158,22 @@ jobs:
           ls -l "$D"/706-* || true
           echo "==> 该补丁把 pci_alloc_irq_vectors 的 nr_irqs 向上取 2 的幂（HH500V 的 5G 稳定性修复）"
 
-      - name: Install custom packages
-        run: |
-          set -e
-          mkdir -p openwrt/package/custom
-          cp -r custom-packages/* openwrt/package/custom/
-          find openwrt/package/custom -maxdepth 2 -name Makefile
-
-      - name: Write feeds.conf
+      - name: Backport AW9523 pinctrl/LED expander (kernel 6.6 has no driver)
+        if: ${{ inputs.version != 'master' }}
         run: |
           set -e
           cd openwrt
-          if [ "${{ inputs.version }}" = "master" ]; then BR=master; else BR=openwrt-24.10; fi
-          {
-            echo "src-git packages https://github.com/immortalwrt/packages.git;$BR"
-            echo "src-git luci https://github.com/immortalwrt/luci.git;$BR"
-            echo "src-git routing https://github.com/immortalwrt/routing.git;$BR"
-            echo "src-git telephony https://github.com/immortalwrt/telephony.git;$BR"
-            echo "src-git video https://github.com/immortalwrt/video.git;$BR"
-            echo "src-git qmodem https://github.com/FUjr/QModem.git;main"
-            echo "src-git small https://github.com/kenzok8/small-package.git;main"
-            if [ "${{ inputs.version }}" != "master" ]; then
-              echo "src-git kenzok8 https://github.com/kenzok8/openwrt-packages.git;master"
-            fi
-          } > feeds.conf.default
-          cat feeds.conf.default
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a || true
-
-      - name: Configure
-        run: |
-          set -e
-          cd openwrt
-          if [ "${{ inputs.plugins }}" = "basic" ]; then
-            cp ../configs/hh500v-basic.config .config
-          elif [ "${{ inputs.version }}" = "master" ]; then
-            cp ../configs/hh500v-master.config .config
+          SRC=drivers/pinctrl/pinctrl-aw9523.c
+          # 24.10 ships kernel 6.6; the AW9523 pinctrl driver only landed in v6.11.
+          # It drives the 5G/4G/WiFi/POWER LEDs (i2c0 @0x5b) on this board.
+          if [ -f ../kernel/pinctrl-aw9523.c ]; then
+            cp ../kernel/pinctrl-aw9523.c "$SRC"
           else
-            cp ../configs/hh500v-24.10.config .config
+            curl -sSL --retry 3 \
+              "https://raw.githubusercontent.com/torvalds/linux/v6.11/drivers/pinctrl/pinctrl-aw9523.c" \
+              -o "$SRC"
           fi
-          make defconfig
-          grep -E "CONFIG_TARGET_qualcommax" .config | head -8
-
-      - name: Download
-        run: |
-          cd openwrt
-          make download -j8 || make download -j1 V=s
-
-      - name: Build
-        run: |
-          cd openwrt
-          make -j$(nproc) || make -j1 V=s
-
-      - name: Collect
-        run: |
-          mkdir -p out
-          find openwrt/bin/targets -type f -name '*hh500v*' -exec cp -v {} out/ \; || true
-          ls -lh out || true
-
-      - name: Upload firmware
-        uses: actions/upload-artifact@v4
-        with:
-          name: hh500v-${{ inputs.version }}-${{ inputs.plugins }}
-          path: out/
-          if-no-files-found: error
+          ls -l "$SRC"
+          grep -c "awinic,aw9523-pinctrl" "$SRC"
+          if ! grep -q "PINCTRL_AW9523" drivers/pinctrl/Kconfig; then
+            printf '\nconfig PINCTRL_AW
