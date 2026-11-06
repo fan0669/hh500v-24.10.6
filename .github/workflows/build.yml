@@ -51,10 +51,17 @@ jobs:
         run: |
           set -e
           V="${{ inputs.version }}"
+          # IMPORTANT: never use --depth here. The next step does `git am -3`
+          # (3-way merge) for ac8b5526bc; a shallow clone has no parent blobs,
+          # so every hunk dies with
+          #   "repository lacks the necessary blob to perform 3-way merge"
+          # and the backport is rejected even though the patch is fine.
+          # --filter=blob:none keeps history complete but downloads blobs
+          # lazily, so 3-way merge can fetch exactly what it needs.
           if [ "$V" = "master" ]; then
-            git clone --depth 50 -b master $REPO openwrt
+            git clone --filter=blob:none -b master $REPO openwrt
           elif [ "$V" = "24.10-SNAPSHOT" ]; then
-            git clone --depth 50 -b openwrt-24.10 $REPO openwrt
+            git clone --filter=blob:none -b openwrt-24.10 $REPO openwrt
           elif [ "$V" = "24.10.6" ]; then
             # v24.10.6 is a real git tag (target commit 5fa11a1b5689, released
             # 2026-04-27). Building from the tag is what makes
@@ -63,12 +70,13 @@ jobs:
             # NOTE: the old path pinned the branch commit cf234f8de6d5, which
             # carries no tag, so git describe degraded to
             # "24.10-SNAPSHOT r0+33869-cf234f8de6".
-            git clone --depth 1 -b v24.10.6 $REPO openwrt
+            git clone --filter=blob:none -b v24.10.6 $REPO openwrt
           else
-            git clone --depth 1 -b "$V" $REPO openwrt || {
-              echo "tag $V 不存在，回退到 openwrt-24.10"; git clone --depth 50 -b openwrt-24.10 $REPO openwrt; }
+            git clone --filter=blob:none -b "$V" $REPO openwrt || {
+              echo "tag $V 不存在，回退到 openwrt-24.10"; git clone --filter=blob:none -b openwrt-24.10 $REPO openwrt; }
           fi
           cd openwrt && git log -1 --oneline
+          echo "commits in history: $(git rev-list --count HEAD)"
 
       - name: Backport HH500V device (non-master)
         if: ${{ inputs.version != 'master' }}
@@ -176,4 +184,94 @@ jobs:
           ls -l "$SRC"
           grep -c "awinic,aw9523-pinctrl" "$SRC"
           if ! grep -q "PINCTRL_AW9523" drivers/pinctrl/Kconfig; then
-            printf '\nconfig PINCTRL_AW
+            printf '\nconfig PINCTRL_AW9523\n\ttristate "Awinic AW9523/AW9523B I2C GPIO expander pinctrl driver"\n\tdepends on OF && I2C\n\tselect PINMUX\n\tselect PINCONF\n\tselect GENERIC_PINCONF\n\tselect GPIOLIB_IRQCHIP\n\tselect REGMAP_I2C\n\thelp\n\t  Say Y here to enable pin controller and GPIO support for the\n\t  Awinic AW9523/AW9523B 16-bit I2C GPIO expander.\n' >> drivers/pinctrl/Kconfig
+          fi
+          if ! grep -q "pinctrl-aw9523" drivers/pinctrl/Makefile; then
+            printf 'obj-$(CONFIG_PINCTRL_AW9523)\t+= pinctrl-aw9523.o\n' >> drivers/pinctrl/Makefile
+          fi
+          tail -3 drivers/pinctrl/Makefile
+          grep -A3 "config PINCTRL_AW9523" drivers/pinctrl/Kconfig
+          echo "==> AW9523 backport ready (CONFIG_PINCTRL_AW9523=y in the target config)"
+
+      - name: Install custom packages
+        run: |
+          set -e
+          mkdir -p openwrt/package/custom
+          cp -r custom-packages/* openwrt/package/custom/
+          find openwrt/package/custom -maxdepth 2 -name Makefile
+          # 板级 overlay：/etc/config/{network,system,wireless} + ath11k caldata 补丁
+          # + 首次启动修好 netifd 的 mbim 协议（支持 wwan 端口设备）+ firewall wan 区
+          if [ -d files ]; then
+            mkdir -p openwrt/files
+            cp -r files/. openwrt/files/
+            # git only tracks the exec bit when the file was added that way;
+            # make sure the scripty bits stay executable
+            # everything under files/usr/bin is executed by something: the two
+            # static helpers (atgw/mbimprox), the .sh tools and hh500v-ca.uc
+            # (LuCI runs it through rpcd exec, so it needs the x bit too)
+            chmod 755 openwrt/files/usr/bin/* 2>/dev/null || true
+            chmod 755 openwrt/files/etc/init.d/* 2>/dev/null || true
+            chmod 755 openwrt/files/etc/uci-defaults/* 2>/dev/null || true
+            chmod 755 openwrt/files/etc/hotplug.d/firmware/* 2>/dev/null || true
+            echo "== files overlay =="
+            find openwrt/files -type f | head -30
+            ls -l openwrt/files/usr/bin openwrt/files/etc/hotplug.d/firmware 2>/dev/null || true
+          fi
+
+      - name: Write feeds.conf
+        run: |
+          set -e
+          cd openwrt
+          if [ "${{ inputs.version }}" = "master" ]; then BR=master; else BR=openwrt-24.10; fi
+          {
+            echo "src-git packages https://github.com/immortalwrt/packages.git;$BR"
+            echo "src-git luci https://github.com/immortalwrt/luci.git;$BR"
+            echo "src-git routing https://github.com/immortalwrt/routing.git;$BR"
+            echo "src-git telephony https://github.com/immortalwrt/telephony.git;$BR"
+            echo "src-git video https://github.com/immortalwrt/video.git;$BR"
+            echo "src-git qmodem https://github.com/FUjr/QModem.git;main"
+            echo "src-git small https://github.com/kenzok8/small-package.git;main"
+            if [ "${{ inputs.version }}" != "master" ]; then
+              echo "src-git kenzok8 https://github.com/kenzok8/openwrt-packages.git;master"
+            fi
+          } > feeds.conf.default
+          cat feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a || true
+
+      - name: Configure
+        run: |
+          set -e
+          cd openwrt
+          if [ "${{ inputs.plugins }}" = "basic" ]; then
+            cp ../configs/hh500v-basic.config .config
+          elif [ "${{ inputs.version }}" = "master" ]; then
+            cp ../configs/hh500v-master.config .config
+          else
+            cp ../configs/hh500v-24.10.config .config
+          fi
+          make defconfig
+          grep -E "CONFIG_TARGET_qualcommax" .config | head -8
+
+      - name: Download
+        run: |
+          cd openwrt
+          make download -j8 || make download -j1 V=s
+
+      - name: Build
+        run: |
+          cd openwrt
+          make -j$(nproc) || make -j1 V=s
+
+      - name: Collect
+        run: |
+          mkdir -p out
+          find openwrt/bin/targets -type f -name '*hh500v*' -exec cp -v {} out/ \; || true
+          ls -lh out || true
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: hh500v-${{ inputs.version }}-${{ inputs.plugins }}
+          path: out/
+          if-no-files-found: error
