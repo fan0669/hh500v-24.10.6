@@ -1,0 +1,4 @@
+	tcl,linkhub-hh500v)
+		tcl_upgrade_prepare
+		nand_do_upgrade "$1"
+		;;

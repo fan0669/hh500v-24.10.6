@@ -18,7 +18,7 @@ ipq807x.mk 里正好模糊匹配到了 `define Device/tplink_eap660hd-v1` 里面
     endef                                 <- 这是 eap660hd 真正的 endef
     TARGET_DEVICES += tplink_eap660hd-v1
 
-`define` 里面套 `define`，Make 会把里面整段当成外层宏的正文 ——
+`define` 里面套 `define`，Make 会把里面整段当成外层宏的正文 —— 
 `TARGET_DEVICES += tcl_linkhub-hh500v` 因此**从来没有被执行**，
 这块板子压根没注册进构建系统。表现就是：
   - make 一路绿（工具链/内核/包都编了，image 阶段跑了）
@@ -68,7 +68,8 @@ RE_DEFINE = re.compile(r"^define\s+Device/" + re.escape(NAME) + r"\s*$")
 RE_TARGET = re.compile(r"^TARGET_DEVICES\s*\+=\s*" + re.escape(NAME) + r"\s*$")
 RE_ENDEF = re.compile(r"^endef\s*$")
 RE_ANY_DEFINE = re.compile(r"^define\s+Device/")
-RE_ANY_ENDEF = re.compile(r"^endef\s*$")
+RE_ANY_DEFINE_ALL = re.compile(r"^\s*define\s+\S+")
+RE_ANY_ENDEF = re.compile(r"^\s*endef\s*$")
 
 
 def strip_bad_blocks(lines):
@@ -117,9 +118,13 @@ def main(argv):
     new_text = "\n".join(lines)
 
     # ---- 自检 ----------------------------------------------------------
+    # 注意：inventory 要数**所有** define（包括 define Build/... 这种非 device 宏），
+    # 不能只数 `define Device/`。24.10.6 的 ipq807x.mk 里有 38 个 Device + 4 个
+    # Build 宏 = 42 个 define / 42 个 endef；只数 Device 会得出 38:42 的假警报。
     check = new_text.split("\n")
-    n_define = sum(1 for l in check if RE_ANY_DEFINE.match(l))
+    n_define = sum(1 for l in check if RE_ANY_DEFINE_ALL.match(l))
     n_endef = sum(1 for l in check if RE_ANY_ENDEF.match(l))
+    n_dev_define = sum(1 for l in check if RE_ANY_DEFINE.match(l))
     n_ours = sum(1 for l in check if RE_DEFINE.match(l))
     n_tgt = sum(1 for l in check if RE_TARGET.match(l))
 
@@ -149,8 +154,8 @@ def main(argv):
 
     print("ipq807x.mk: removed %d misplaced block(s); appended canonical Device/%s at EOF"
           % (removed, NAME))
-    print("check: define=%d endef=%d our_block=%d target_line=%d  -> OK"
-          % (n_define, n_endef, n_ours, n_tgt))
+    print("check: all_define=%d endef=%d device_define=%d our_block=%d target_line=%d  -> OK"
+          % (n_define, n_endef, n_dev_define, n_ours, n_tgt))
     return 0
 
 
