@@ -1,0 +1,451 @@
+name: Build HH500V ImmortalWrt
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'firmware version'
+        required: true
+        default: '24.10.6'
+        type: choice
+        options:
+          - '24.10.6'          # v24.10.6 tag (5fa11a1b, 2026-04-27) -> opkg, needs backport
+          - 'v24.10.5'         # fixed tag (kernel 6.6.122) -> opkg, needs backport
+          - '24.10-SNAPSHOT'   # 24.10 branch head -> opkg, needs backport
+          - 'master'           # 6.18 kernel, native HH500V support, apk
+      plugins:
+        description: 'plugin set'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - 'full'
+          - 'basic'
+
+env:
+  REPO: https://github.com/immortalwrt/immortalwrt
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk \
+            gettext git libelf-dev libncurses5-dev libssl-dev python3 python3-distutils \
+            rsync swig unzip zlib1g-dev zip binutils bzip2 perl diffstat patch \
+            device-tree-compiler qemu-utils
+
+      - name: Clone ImmortalWrt
+        run: |
+          set -e
+          V="${{ inputs.version }}"
+          # IMPORTANT: never use --depth here. The next step does `git am -3`
+          # (3-way merge) for ac8b5526bc; a shallow clone has no parent blobs,
+          # so every hunk dies with
+          #   "repository lacks the necessary blob to perform 3-way merge"
+          # and the backport is rejected even though the patch is fine.
+          # --filter=blob:none keeps history complete but downloads blobs
+          # lazily, so 3-way merge can fetch exactly what it needs.
+          if [ "$V" = "master" ]; then
+            git clone --filter=blob:none -b master $REPO openwrt
+          elif [ "$V" = "24.10-SNAPSHOT" ]; then
+            git clone --filter=blob:none -b openwrt-24.10 $REPO openwrt
+          elif [ "$V" = "24.10.6" ]; then
+            # v24.10.6 is a real git tag (target commit 5fa11a1b5689, released
+            # 2026-04-27). Building from the tag is what makes
+            # /etc/openwrt_release say "24.10.6" and points the opkg feeds at
+            # releases/24.10.6 instead of releases/24.10-SNAPSHOT.
+            # NOTE: the old path pinned the branch commit cf234f8de6d5, which
+            # carries no tag, so git describe degraded to
+            # "24.10-SNAPSHOT r0+33869-cf234f8de6".
+            git clone --filter=blob:none -b v24.10.6 $REPO openwrt
+          else
+            git clone --filter=blob:none -b "$V" $REPO openwrt || {
+              echo "tag $V 不存在，回退到 openwrt-24.10"; git clone --filter=blob:none -b openwrt-24.10 $REPO openwrt; }
+          fi
+          cd openwrt && git log -1 --oneline
+          echo "commits in history: $(git rev-list --count HEAD)"
+
+      - name: Backport HH500V device (non-master)
+        if: ${{ inputs.version != 'master' }}
+        run: |
+          set -e
+          cd openwrt
+          git config user.email ci@local
+          git config user.name ci
+          # 有些基座（比如将来的 24.10.x / 25.12）已经自带这块板子，那就别再打补丁
+          if grep -q "tcl_linkhub-hh500v" target/linux/qualcommax/image/ipq807x.mk; then
+            echo "== device already present in this base, skip the backports =="
+            grep -n "tcl_linkhub-hh500v" target/linux/qualcommax/image/ipq807x.mk
+            grep -n "tcl_linkhub" package/firmware/ipq-wifi/Makefile || true
+            exit 0
+          fi
+          # ---- 关键：patch 里的 index 行指向 openwrt *master* 的前置 blob ----
+          # 那个 blob 在 24.10 的树里根本不存在（24.10 的这些文件是另一份历史），
+          # 所以 `git am -3` 一定报
+          #   error: repository lacks the necessary blob to perform 3-way merge
+          # 然后退化成一字不差的直接 apply，hunk 全部 reject。
+          # 解法：把上游这几个 commit 以 --depth 2 抓进来 —— 父提交一到，
+          # 前置 blob 就在本地对象库里了，三方合并才有依据。
+          git remote add upstream https://github.com/openwrt/openwrt.git 2>/dev/null || true
+          for sha in ac8b5526bc 12fd85eb79 30378ffea4; do
+            echo "== fetch upstream $sha (depth 2, 把前置 blob 一起取回来)"
+            git fetch --depth 2 --no-tags upstream "$sha" || \
+              git fetch --no-tags upstream "$sha" || echo "WARN: fetch $sha failed"
+          done
+          for sha in ac8b5526bc 12fd85eb79 30378ffea4; do
+            echo "== backport $sha"
+            curl -sSL "https://github.com/openwrt/openwrt/commit/$sha.patch" -o "/tmp/$sha.patch"
+            if git am -3 "/tmp/$sha.patch"; then
+              echo "   ok: git am -3"
+              continue
+            fi
+            git am --abort 2>/dev/null || true
+            if git apply -3 "/tmp/$sha.patch"; then
+              git add -A; git commit -m "backport $sha (apply -3)" || true
+              echo "   ok: git apply -3"
+              continue
+            fi
+            # 三方合并失败的真正原因：patch 的 index 行指向 openwrt *master* 的前置
+            # blob，24.10 的树里没有这个对象。这时只能靠模糊匹配把 hunk 落下去。
+            # 注意：patch 只要有一个 hunk 不完美就回非 0，所以这里**不能**判死，
+            # 打完补丁后再按"结果对不对"来断言（见下面的 verify）。
+            echo "   fallback: patch -p1 --forward --fuzz=3"
+            patch -p1 --forward --fuzz=3 -l --no-backup-if-mismatch < "/tmp/$sha.patch" || true
+            echo "   rejected hunks:"
+            find . -name '*.rej' -print | sed 's/^/     /' || true
+            find . -name '*.rej' -delete || true
+            find . -name '*.orig' -delete || true
+            git add -A; git commit -m "backport $sha (fuzzy)" || true
+          done
+
+          # 24.10 用的是 config-6.6；上游补丁动的是 config-6.12，模糊 apply 会
+          # 凭空造出一个只有几行的 config-6.12，删掉以免干扰。
+          rm -f target/linux/qualcommax/config-6.12
+
+          # ---- 把 device 块挪到正确位置 --------------------------------------
+          # `patch -p1 --fuzz=3` 在 24.10 的 ipq807x.mk 里，把这个 hunk 的上下文
+          # 模糊匹配到了 `define Device/tplink_eap660hd-v1` 内部，于是变成
+          # define 套 define：
+          #     define Device/tplink_eap660hd-v1
+          #     ...
+          #     define Device/tcl_linkhub-hh500v   <- 被塞进来
+          #     ...
+          #     endef
+          #     TARGET_DEVICES += tcl_linkhub-hh500v
+          #     endef                             <- eap660hd 真正的 endef
+          # Make 把里面整段当成外层宏的正文，`TARGET_DEVICES += tcl_linkhub-hh500v`
+          # 因此从来没有执行过 —— 板子压根没注册进构建系统。表现就是：
+          # make 一路绿（工具链/内核/59 个包都编了，image 阶段也跑了），
+          # 但 bin/targets 里 0 个设备 → Collect 的 out/ 空的 → upload 报
+          # "No files were found with the provided path: out/"，
+          # 而且 .config 里 CONFIG_TARGET_..._DEVICE_tcl_linkhub-hh500v 被丢掉。
+          # 这个脚本把散落的块删掉、在文件末尾追加一份正确的，并自检结构。
+          python3 ../port/fix-ipq807x-device.py target/linux/qualcommax/image/ipq807x.mk
+
+          # ---- ipq-wifi 的 BDF 包：不能指望那个 patch 落下来 -------------------
+          # DEVICE_PACKAGES 里有 `ipq-wifi-tcl_linkhub-hh500v`，这个包由
+          # package/firmware/ipq-wifi/Makefile 的 ALLWIFIBOARDS +（eval generate-
+          # ipq-wifi-package ...) 循环生成。24.10.6 里没有它，而上游 commit
+          # 12fd85eb79 的 hunk 上下文（PKG_RELEASE / PKG_SOURCE_* 那几行）在 24.10
+          # 里对不上，日志里就是：
+          #   patching file package/firmware/ipq-wifi/Makefile
+          #   Hunk #1 FAILED at 6.
+          #   1 out of 1 hunk FAILED -- saving rejects to .../Makefile.rej
+          # 所以这里用确定性替换补上：加板子名、加 eval 行、把版本升到含这块
+          # BDF 的 qca-wireless 提交（PKG_MIRROR_HASH 删掉重算，旧 hash 必挂）。
+          python3 ../port/fix-ipq-wifi.py package/firmware/ipq-wifi/Makefile
+
+          echo "== verify backport result =="
+          fail=0
+          test -s target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq8072-linkhub-hh500v.dts \
+            || { echo "!! DTS missing"; fail=1; }
+          grep -q "tcl_linkhub-hh500v" target/linux/qualcommax/image/ipq807x.mk \
+            || { echo "!! ipq807x.mk has no device entry"; fail=1; }
+          # device 块必须在文件末尾（后面不能还有别的 define），TARGET_DEVICES 只能一条
+          n_tgt=$(grep -c '^TARGET_DEVICES += tcl_linkhub-hh500v$' target/linux/qualcommax/image/ipq807x.mk || true)
+          [ "$n_tgt" = "1" ] || { echo "!! TARGET_DEVICES += tcl_linkhub-hh500v 有 $n_tgt 条（应为 1）"; fail=1; }
+          # 块结构自检：define 之后必须先 endef、再 TARGET_DEVICES，中间不能再套 define
+          if awk '
+            /^define Device\/tcl_linkhub-hh500v$/ { ind=NR; next }
+            ind && !closed {
+              if (/^endef$/) { closed=NR; next }
+              if (/^define Device\//) { printf("!! 块内又出现 define: %s\n", $0); bad=1 }
+              next
+            }
+            closed && !done {
+              if ($0 ~ /^[[:space:]]*$/) next
+              if ($0 == "TARGET_DEVICES += tcl_linkhub-hh500v") { done=1 }
+              else { printf("!! endef 之后紧跟的是: %s\n", $0); bad=1; done=1 }
+            }
+            END {
+              if (!ind) { print "!! 没有 define Device/tcl_linkhub-hh500v"; bad=1 }
+              if (ind && !closed) { print "!! 没有与之配对的 endef"; bad=1 }
+              if (closed && !done) { print "!! endef 之后没有 TARGET_DEVICES += tcl_linkhub-hh500v"; bad=1 }
+              exit bad
+            }' target/linux/qualcommax/image/ipq807x.mk; then
+            :
+          else
+            fail=1
+          fi
+          grep -q "linkhub-hh500v" target/linux/qualcommax/ipq807x/base-files/etc/board.d/02_network \
+            || { echo "!! 02_network has no hh500v case"; fail=1; }
+          grep -q "linkhub-hh500v" target/linux/qualcommax/ipq807x/base-files/etc/board.d/01_leds \
+            || { echo "!! 01_leds has no hh500v case"; fail=1; }
+          grep -q 'tcl_linkhub-hh500v \\' package/firmware/ipq-wifi/Makefile \
+            || { echo "!! ipq-wifi ALLWIFIBOARDS has no tcl_linkhub-hh500v"; fail=1; }
+          grep -q "generate-ipq-wifi-package,tcl_linkhub-hh500v," package/firmware/ipq-wifi/Makefile \
+            || { echo "!! ipq-wifi has no generate-ipq-wifi-package line for hh500v"; fail=1; }
+          grep -q "^PKG_SOURCE_VERSION:=8e1fb2f59893dc4ce3203b7649e61b30fde2d5a8$" package/firmware/ipq-wifi/Makefile \
+            || { echo "!! ipq-wifi PKG_SOURCE_VERSION was not bumped to the BDF commit"; fail=1; }
+          [ "$fail" = 0 ] || { echo "!! backport incomplete"; find . -name '*.rej'; exit 1; }
+          grep -n "tcl_linkhub-hh500v" target/linux/qualcommax/image/ipq807x.mk
+          ls -l target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq8072-linkhub-hh500v.dts
+          echo "NOTE: 24.10 uses kernel 6.6; the MHI IRQ fix only exists for 6.12/6.18 upstream."
+
+      # A/B 双分区 sysupgrade（换槽 + 保留旧系统）靠三个文件，24.10 基座里一个都没有：
+      #   lib/upgrade/tcl.sh            ac8b5526bc 新增
+      #   lib/upgrade/platform.sh 的 tcl,linkhub-hh500v) 分支   ac8b5526bc 新增
+      #   lib/functions/bootconfig.sh   24.10 基座缺，tcl.sh 靠它读写 0:BOOTCONFIG
+      # 缺任何一个，sysupgrade 会退回通用 nand_do_upgrade —— 直接覆盖正在跑的分区，
+      # 一旦刷坏就只能走 TFTP 救砖。所以这里补齐 + 断言，不依赖 cherry-pick 是否干净。
+      - name: Ensure A/B sysupgrade helpers (tcl.sh + bootconfig.sh)
+        if: ${{ inputs.version != 'master' }}
+        run: |
+          set -e
+          cd openwrt
+          T=target/linux/qualcommax/ipq807x/base-files
+          D=$T/lib/upgrade
+          F=$T/lib/functions
+          mkdir -p "$D" "$F"
+
+          # 1) platform.sh：插 tcl,linkhub-hh500v) 分支（已存在则跳过）
+          python3 ../port/insert-hh500v-case.py "$D/platform.sh"
+
+          # 2) tcl.sh：换分区 + 修 bootdelay
+          if [ -s "$D/tcl.sh" ]; then
+            echo "tcl.sh already present ($(wc -l < "$D/tcl.sh") lines)"
+          else
+            cp ../port/upstream/tcl.sh "$D/tcl.sh"
+            echo "tcl.sh restored from port/upstream"
+          fi
+
+          # 3) bootconfig.sh：读写 0:BOOTCONFIG / 0:BOOTCONFIG1 的 rootfs 主备位
+          if [ -s "$F/bootconfig.sh" ]; then
+            echo "bootconfig.sh already present"
+          else
+            cp ../port/upstream/bootconfig.sh "$F/bootconfig.sh"
+            echo "bootconfig.sh restored from port/upstream"
+          fi
+
+          # 4) 断言：三个文件都在，且 platform.sh 认得这块板子
+          test -s "$D/tcl.sh" || { echo "!! tcl.sh missing"; exit 1; }
+          test -s "$F/bootconfig.sh" || { echo "!! bootconfig.sh missing"; exit 1; }
+          grep -q 'linkhub-hh500v' "$D/platform.sh" || { echo "!! platform.sh has no hh500v case"; exit 1; }
+          grep -q 'bootconfig.sh' "$D/tcl.sh" || echo "WARN: tcl.sh does not source bootconfig.sh"
+          grep -n 'linkhub-hh500v' "$D/platform.sh"
+          ls -l "$D/tcl.sh" "$D/platform.sh" "$F/bootconfig.sh"
+          echo "==> A/B sysupgrade helpers OK: sysupgrade 会换到另一个 slot，旧系统留着能回退"
+
+      - name: Backport MHI IRQ fix to 6.6 (non-master)
+        if: ${{ inputs.version != 'master' }}
+        run: |
+          set -e
+          cd openwrt
+          D=target/linux/generic/backport-6.6
+          mkdir -p "$D"
+          cp ../patches/706-v7.2-bus-mhi-host-pci_generic-round-up-nr_irqs-to-a-power-of-two.patch "$D/"
+          ls -l "$D"/706-* || true
+          echo "==> 该补丁把 pci_alloc_irq_vectors 的 nr_irqs 向上取 2 的幂（HH500V 的 5G 稳定性修复）"
+
+      # 原来这里有个 "Backport AW9523 pinctrl/LED expander" 步骤，从 v6.11 把
+      # drivers/pinctrl/pinctrl-aw9523.c 拷进内核树 —— 这条路走不通：
+      #   cp: cannot create regular file 'drivers/pinctrl/pinctrl-aw9523.c': No such file or directory
+      # 因为内核源码要到 Download/prepare 阶段才解包，此刻 openwrt/ 下根本没有
+      # drivers/。而且这块板子的灯不需要内核驱动：/sys/bus/i2c/drivers 里没有
+      # aw9523，0-005b 也没绑定 driver，灯是 files/usr/bin/led-hh500v.sh 直接
+      # 通过 i2c 写的（已在设备上验证）。所以这一步整个删掉。
+
+      - name: Install custom packages
+        run: |
+          set -e
+          mkdir -p openwrt/package/custom
+          cp -r custom-packages/* openwrt/package/custom/
+          find openwrt/package/custom -maxdepth 2 -name Makefile
+          # 板级 overlay：/etc/config/{network,system,wireless} + ath11k caldata 补丁
+          # + 首次启动修好 netifd 的 mbim 协议（支持 wwan 端口设备）+ firewall wan 区
+          if [ -d files ]; then
+            mkdir -p openwrt/files
+            cp -r files/. openwrt/files/
+            # git only tracks the exec bit when the file was added that way;
+            # make sure the scripty bits stay executable
+            # everything under files/usr/bin is executed by something: the two
+            # static helpers (atgw/mbimprox), the .sh tools and hh500v-ca.uc
+            # (LuCI runs it through rpcd exec, so it needs the x bit too)
+            chmod 755 openwrt/files/usr/bin/* 2>/dev/null || true
+            chmod 755 openwrt/files/etc/init.d/* 2>/dev/null || true
+            chmod 755 openwrt/files/etc/uci-defaults/* 2>/dev/null || true
+            chmod 755 openwrt/files/etc/hotplug.d/firmware/* 2>/dev/null || true
+            echo "== files overlay =="
+            find openwrt/files -type f | head -30
+            ls -l openwrt/files/usr/bin openwrt/files/etc/hotplug.d/firmware 2>/dev/null || true
+          fi
+
+      - name: Write feeds.conf
+        run: |
+          # 注意：这一步不能用 set -e。`feeds update -a` 只要有一个 feed 有问题
+          # （第三方 feed 经常改结构 / 404 / 分支名变动）就整体返回 1，但其它
+          # feed 其实都已经更新好了。上一轮就是死在
+          #   Collecting target info: done
+          #   Error: Process completed with exit code 1.
+          # 所以这里改成逐个更新 + 只对"必需的 feed"做硬断言。
+          set -u
+          cd openwrt
+          if [ "${{ inputs.version }}" = "master" ]; then BR=master; else BR=openwrt-24.10; fi
+          {
+            echo "src-git packages https://github.com/immortalwrt/packages.git;$BR"
+            echo "src-git luci https://github.com/immortalwrt/luci.git;$BR"
+            echo "src-git routing https://github.com/immortalwrt/routing.git;$BR"
+            echo "src-git telephony https://github.com/immortalwrt/telephony.git;$BR"
+            echo "src-git video https://github.com/immortalwrt/video.git;$BR"
+            echo "src-git qmodem https://github.com/FUjr/QModem.git;main"
+            echo "src-git small https://github.com/kenzok8/small-package.git;main"
+            if [ "${{ inputs.version }}" != "master" ]; then
+              echo "src-git kenzok8 https://github.com/kenzok8/openwrt-packages.git;master"
+            fi
+          } > feeds.conf.default
+          cat feeds.conf.default
+
+          for f in packages luci routing telephony video qmodem small; do
+            echo "== feeds update $f"
+            ./scripts/feeds update "$f" || echo "WARN: feeds update $f returned non-zero (继续)"
+          done
+          if [ "${{ inputs.version }}" != "master" ]; then
+            echo "== feeds update kenzok8"
+            ./scripts/feeds update kenzok8 || echo "WARN: feeds update kenzok8 returned non-zero (继续)"
+          fi
+
+          ./scripts/feeds install -a || echo "WARN: feeds install -a returned non-zero (继续)"
+
+          # 只有这三个是硬需求：target 本身 + luci + qmodem（QModem 面板）
+          for f in packages luci qmodem; do
+            [ -d "feeds/$f" ] || { echo "!! feed $f is missing, 无法继续"; exit 1; }
+          done
+          echo "== feeds present =="
+          ls -1 feeds
+          echo "== 抽查关键包是否在 feed 里 =="
+          ls -d feeds/qmodem/qmodem feeds/luci/applications/luci-app-sms-tool-js 2>/dev/null || true
+          ls -d feeds/packages/net/modemmanager 2>/dev/null || true
+
+      - name: Configure
+        run: |
+          set -e
+          cd openwrt
+          if [ "${{ inputs.plugins }}" = "basic" ]; then
+            cp ../configs/hh500v-basic.config .config
+          elif [ "${{ inputs.version }}" = "master" ]; then
+            cp ../configs/hh500v-master.config .config
+          else
+            cp ../configs/hh500v-24.10.config .config
+          fi
+          make defconfig > /tmp/defconfig.log 2>&1 || { cat /tmp/defconfig.log; exit 1; }
+          grep -E "CONFIG_TARGET_qualcommax" .config | head -8
+
+          # ---- 关键断言：设备必须真的被选中 -------------------------------
+          # 上一轮 Build 是绿的、跑了 2h19m，但 Collect 里 out/ 是空的
+          # （total 0 → upload-artifact 报 No files were found），说明 .config
+          # 里没有这个设备，make 只编了 target/内核/包，根本没走 image 阶段。
+          # 在这里拦住：40 秒就失败，不用等两个多小时。
+          echo "== 设备断言 =="
+          # dump-target-info.pl 不依赖工具链，直接解析 target Makefile，
+          # 能在 1 秒内告诉我们"这块板子到底有没有注册进构建系统"
+          echo "--- dump-target-info: hh500v ---"
+          perl ./scripts/dump-target-info.pl 2>/dev/null | grep -i 'hh500v' || echo "(dump-target-info 里没有 hh500v)"
+          echo "--- dump-target-info: qualcommax/ipq807x 全部 device ---"
+          perl ./scripts/dump-target-info.pl 2>/dev/null | awk '$1=="qualcommax/ipq807x"{print $2}' | head -40 || true
+          echo "--- .config 里 ipq807x 的 device 行 ---"
+          grep -E '^CONFIG_TARGET_qualcommax_ipq807x_DEVICE' .config || echo "(一条都没有)"
+
+          if grep -qx 'CONFIG_TARGET_qualcommax_ipq807x_DEVICE_tcl_linkhub-hh500v=y' .config; then
+            echo "OK: ipq807x device tcl_linkhub-hh500v 已选中"
+          else
+            echo "!! 设备没被选中：CONFIG_TARGET_qualcommax_ipq807x_DEVICE_tcl_linkhub-hh500v"
+            echo "== defconfig 里跟 hh500v / 告警有关的部分 =="
+            grep -n -i -E 'warn|error|hh500v|linkhub' /tmp/defconfig.log | head -40 || true
+            echo "== .config 里所有被选中的 device =="
+            grep -E '^CONFIG_TARGET_.*_DEVICE_.*=y' .config | head -20 || true
+            echo "== .config 里含 hh500v 的行 =="
+            grep -n -i 'hh500v' .config || echo "(一条都没有)"
+            echo "== ipq807x.mk 里有没有这个 device =="
+            grep -n -B2 -A16 'define Device/tcl_linkhub-hh500v' target/linux/qualcommax/image/ipq807x.mk \
+              || { echo "(没有 define Device/tcl_linkhub-hh500v)"; grep -n 'tcl_linkhub-hh500v' target/linux/qualcommax/image/ipq807x.mk || echo "(连字符串都没有)"; }
+            exit 1
+          fi
+
+          # ipq-wifi 的 BDF 包是 DEVICE_PACKAGES 的一员；缺了它镜像阶段会报错
+          if grep -q '^CONFIG_PACKAGE_ipq-wifi-tcl_linkhub-hh500v=y' .config; then
+            echo "OK: 固件包 ipq-wifi-tcl_linkhub-hh500v 已选中"
+          else
+            echo "WARN: .config 里没有 CONFIG_PACKAGE_ipq-wifi-tcl_linkhub-hh500v=y"
+            grep -n -i 'ipq-wifi' .config | head -10 || true
+          fi
+          echo "== 镜像开关 =="
+          grep -E '^CONFIG_TARGET_(MULTI_PROFILE|ALL_PROFILES|ROOTFS|IMAGES)' .config | head -10 || true
+
+      - name: Download
+        run: |
+          cd openwrt
+          make download -j8 || make download -j1 V=s
+
+      - name: Build
+        run: |
+          cd openwrt
+          make -j$(nproc) || make -j1 V=s
+
+      - name: Collect
+        run: |
+          set -u
+          mkdir -p out
+          echo "== bin 目录多大 =="
+          du -sh openwrt/bin 2>/dev/null || true
+          echo "== bin/targets 下的目录 =="
+          find openwrt/bin/targets -maxdepth 3 -type d 2>/dev/null | head -40 || true
+          echo "== qualcommax/ipq807x 里的文件 =="
+          ls -lh openwrt/bin/targets/qualcommax/ipq807x/ 2>/dev/null || echo "(目录不存在)"
+          echo "== 全仓库里所有 hh500v 文件 =="
+          find openwrt/bin -type f -name '*hh500v*' -exec ls -lh {} \; 2>/dev/null || true
+
+          echo "== 拷贝 hh500v 产物 =="
+          find openwrt/bin/targets -type f -name '*hh500v*' -exec cp -v {} out/ \; 2>/dev/null || true
+          n=$(ls -1 out 2>/dev/null | wc -l | tr -d ' ')
+          echo "copied $n file(s)"
+
+          # 兜底：万一名字对不上（例如被改成 tcl-linkhub-hh500v 之外的形式），
+          # 把整个 ipq807x 输出目录一起收走，至少 artifact 不会为空
+          if [ "$n" -eq 0 ]; then
+            echo "!! 没有 hh500v 产物，退回收集整个 ipq807x 目录"
+            for f in openwrt/bin/targets/qualcommax/ipq807x/*; do
+              [ -f "$f" ] && cp -v "$f" out/ || true
+            done
+            du -sh openwrt/bin/targets/qualcommax/ipq807x/ 2>/dev/null || true
+          fi
+          ls -lh out || true
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: hh500v-${{ inputs.version }}-${{ inputs.plugins }}
+          path: out/
+          if-no-files-found: error
