@@ -297,8 +297,49 @@ jobs:
           else
             cp ../configs/hh500v-24.10.config .config
           fi
-          make defconfig
+          make defconfig > /tmp/defconfig.log 2>&1 || { cat /tmp/defconfig.log; exit 1; }
           grep -E "CONFIG_TARGET_qualcommax" .config | head -8
+
+          # ---- 关键断言：设备必须真的被选中 -------------------------------
+          # 上一轮 Build 是绿的、跑了 2h19m，但 Collect 里 out/ 是空的
+          # （total 0 → upload-artifact 报 No files were found），说明 .config
+          # 里没有这个设备，make 只编了 target/内核/包，根本没走 image 阶段。
+          # 在这里拦住：40 秒就失败，不用等两个多小时。
+          echo "== 设备断言 =="
+          # dump-target-info.pl 不依赖工具链，直接解析 target Makefile，
+          # 能在 1 秒内告诉我们"这块板子到底有没有注册进构建系统"
+          echo "--- dump-target-info: hh500v ---"
+          perl ./scripts/dump-target-info.pl 2>/dev/null | grep -i 'hh500v' || echo "(dump-target-info 里没有 hh500v)"
+          echo "--- dump-target-info: qualcommax/ipq807x 全部 device ---"
+          perl ./scripts/dump-target-info.pl 2>/dev/null | awk '$1=="qualcommax/ipq807x"{print $2}' | head -40 || true
+          echo "--- .config 里 ipq807x 的 device 行 ---"
+          grep -E '^CONFIG_TARGET_qualcommax_ipq807x_DEVICE' .config || echo "(一条都没有)"
+
+          if grep -qx 'CONFIG_TARGET_qualcommax_ipq807x_DEVICE_tcl_linkhub-hh500v=y' .config; then
+            echo "OK: ipq807x device tcl_linkhub-hh500v 已选中"
+          else
+            echo "!! 设备没被选中：CONFIG_TARGET_qualcommax_ipq807x_DEVICE_tcl_linkhub-hh500v"
+            echo "== defconfig 里跟 hh500v / 告警有关的部分 =="
+            grep -n -i -E 'warn|error|hh500v|linkhub' /tmp/defconfig.log | head -40 || true
+            echo "== .config 里所有被选中的 device =="
+            grep -E '^CONFIG_TARGET_.*_DEVICE_.*=y' .config | head -20 || true
+            echo "== .config 里含 hh500v 的行 =="
+            grep -n -i 'hh500v' .config || echo "(一条都没有)"
+            echo "== ipq807x.mk 里有没有这个 device =="
+            grep -n -B2 -A16 'define Device/tcl_linkhub-hh500v' target/linux/qualcommax/image/ipq807x.mk \
+              || { echo "(没有 define Device/tcl_linkhub-hh500v)"; grep -n 'tcl_linkhub-hh500v' target/linux/qualcommax/image/ipq807x.mk || echo "(连字符串都没有)"; }
+            exit 1
+          fi
+
+          # ipq-wifi 的 BDF 包是 DEVICE_PACKAGES 的一员；缺了它镜像阶段会报错
+          if grep -q '^CONFIG_PACKAGE_ipq-wifi-tcl_linkhub-hh500v=y' .config; then
+            echo "OK: 固件包 ipq-wifi-tcl_linkhub-hh500v 已选中"
+          else
+            echo "WARN: .config 里没有 CONFIG_PACKAGE_ipq-wifi-tcl_linkhub-hh500v=y"
+            grep -n -i 'ipq-wifi' .config | head -10 || true
+          fi
+          echo "== 镜像开关 =="
+          grep -E '^CONFIG_TARGET_(MULTI_PROFILE|ALL_PROFILES|ROOTFS|IMAGES)' .config | head -10 || true
 
       - name: Download
         run: |
@@ -312,8 +353,31 @@ jobs:
 
       - name: Collect
         run: |
+          set -u
           mkdir -p out
-          find openwrt/bin/targets -type f -name '*hh500v*' -exec cp -v {} out/ \; || true
+          echo "== bin 目录多大 =="
+          du -sh openwrt/bin 2>/dev/null || true
+          echo "== bin/targets 下的目录 =="
+          find openwrt/bin/targets -maxdepth 3 -type d 2>/dev/null | head -40 || true
+          echo "== qualcommax/ipq807x 里的文件 =="
+          ls -lh openwrt/bin/targets/qualcommax/ipq807x/ 2>/dev/null || echo "(目录不存在)"
+          echo "== 全仓库里所有 hh500v 文件 =="
+          find openwrt/bin -type f -name '*hh500v*' -exec ls -lh {} \; 2>/dev/null || true
+
+          echo "== 拷贝 hh500v 产物 =="
+          find openwrt/bin/targets -type f -name '*hh500v*' -exec cp -v {} out/ \; 2>/dev/null || true
+          n=$(ls -1 out 2>/dev/null | wc -l | tr -d ' ')
+          echo "copied $n file(s)"
+
+          # 兜底：万一名字对不上（例如被改成 tcl-linkhub-hh500v 之外的形式），
+          # 把整个 ipq807x 输出目录一起收走，至少 artifact 不会为空
+          if [ "$n" -eq 0 ]; then
+            echo "!! 没有 hh500v 产物，退回收集整个 ipq807x 目录"
+            for f in openwrt/bin/targets/qualcommax/ipq807x/*; do
+              [ -f "$f" ] && cp -v "$f" out/ || true
+            done
+            du -sh openwrt/bin/targets/qualcommax/ipq807x/ 2>/dev/null || true
+          fi
           ls -lh out || true
 
       - name: Upload firmware
