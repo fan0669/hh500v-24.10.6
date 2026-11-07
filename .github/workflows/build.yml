@@ -135,12 +135,58 @@ jobs:
           # 凭空造出一个只有几行的 config-6.12，删掉以免干扰。
           rm -f target/linux/qualcommax/config-6.12
 
+          # ---- 把 device 块挪到正确位置 --------------------------------------
+          # `patch -p1 --fuzz=3` 在 24.10 的 ipq807x.mk 里，把这个 hunk 的上下文
+          # 模糊匹配到了 `define Device/tplink_eap660hd-v1` 内部，于是变成
+          # define 套 define：
+          #     define Device/tplink_eap660hd-v1
+          #     ...
+          #     define Device/tcl_linkhub-hh500v   <- 被塞进来
+          #     ...
+          #     endef
+          #     TARGET_DEVICES += tcl_linkhub-hh500v
+          #     endef                             <- eap660hd 真正的 endef
+          # Make 把里面整段当成外层宏的正文，`TARGET_DEVICES += tcl_linkhub-hh500v`
+          # 因此从来没有执行过 —— 板子压根没注册进构建系统。表现就是：
+          # make 一路绿（工具链/内核/59 个包都编了，image 阶段也跑了），
+          # 但 bin/targets 里 0 个设备 → Collect 的 out/ 空的 → upload 报
+          # "No files were found with the provided path: out/"，
+          # 而且 .config 里 CONFIG_TARGET_..._DEVICE_tcl_linkhub-hh500v 被丢掉。
+          # 这个脚本把散落的块删掉、在文件末尾追加一份正确的，并自检结构。
+          python3 ../port/fix-ipq807x-device.py target/linux/qualcommax/image/ipq807x.mk
+
           echo "== verify backport result =="
           fail=0
           test -s target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq8072-linkhub-hh500v.dts \
             || { echo "!! DTS missing"; fail=1; }
           grep -q "tcl_linkhub-hh500v" target/linux/qualcommax/image/ipq807x.mk \
             || { echo "!! ipq807x.mk has no device entry"; fail=1; }
+          # device 块必须在文件末尾（后面不能还有别的 define），TARGET_DEVICES 只能一条
+          n_tgt=$(grep -c '^TARGET_DEVICES += tcl_linkhub-hh500v$' target/linux/qualcommax/image/ipq807x.mk || true)
+          [ "$n_tgt" = "1" ] || { echo "!! TARGET_DEVICES += tcl_linkhub-hh500v 有 $n_tgt 条（应为 1）"; fail=1; }
+          # 块结构自检：define 之后必须先 endef、再 TARGET_DEVICES，中间不能再套 define
+          if awk '
+            /^define Device\/tcl_linkhub-hh500v$/ { ind=NR; next }
+            ind && !closed {
+              if (/^endef$/) { closed=NR; next }
+              if (/^define Device\//) { printf("!! 块内又出现 define: %s\n", $0); bad=1 }
+              next
+            }
+            closed && !done {
+              if ($0 ~ /^[[:space:]]*$/) next
+              if ($0 == "TARGET_DEVICES += tcl_linkhub-hh500v") { done=1 }
+              else { printf("!! endef 之后紧跟的是: %s\n", $0); bad=1; done=1 }
+            }
+            END {
+              if (!ind) { print "!! 没有 define Device/tcl_linkhub-hh500v"; bad=1 }
+              if (ind && !closed) { print "!! 没有与之配对的 endef"; bad=1 }
+              if (closed && !done) { print "!! endef 之后没有 TARGET_DEVICES += tcl_linkhub-hh500v"; bad=1 }
+              exit bad
+            }' target/linux/qualcommax/image/ipq807x.mk; then
+            :
+          else
+            fail=1
+          fi
           grep -q "linkhub-hh500v" target/linux/qualcommax/ipq807x/base-files/etc/board.d/02_network \
             || { echo "!! 02_network has no hh500v case"; fail=1; }
           grep -q "linkhub-hh500v" target/linux/qualcommax/ipq807x/base-files/etc/board.d/01_leds \
